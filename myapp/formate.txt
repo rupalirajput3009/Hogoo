@@ -1,0 +1,167 @@
+Admin:-Hogo
+password:-Hogo@123
+
+
+15/5/2026
+Distributor Information
+GET:-https://hogofilm.pythonanywhere.com/distributor-information/?state=Gujarat&city=Ahmedabad&status=Approved
+
+FORMATE[
+            "id": 14,
+            "distributor_type": "Pvt Ltd",
+            "distributor_name": "Codingcloud",
+            "brand_name": "Nexon",
+            "date_of_registration": "2026-04-30",
+            "status": "Approved",
+            "sales_region": "north",
+            "authorized_products": "helloo",
+            "contact_person_name": "Saransh shukla",
+            "designation": "Manager",
+            "mobile_number": "9023214738",
+            "alternate_mobile": "9023214738",
+            "email_id": "saransh@gmail.com",
+            "password": "123456",
+            "address_line_1": "ahmedabad",
+            "address_line_2": null,
+            "city": "ahmedabad",
+            "state": "gujrat",
+            "pincode": "382345",
+            "country": "India",
+            "business_type": "WHOLESALER",
+            "years_in_business": 10,
+            "gst_number": null,
+            "gst_certificate": "/media/documents/gst/images.jpg",
+            "pan_number": null,
+            "pan_card_copy": "/media/documents/pan/ChatGPT_Image_Apr_30_2026_11_21_15_AM.png",
+            "cin_llpin": "U72900GJ2023PTC123456",
+            "incorporation_certificate": "/media/documents/incorporation/Gemini_Generated_Image_8b5hau8b5hau8b5h.png",
+            "owner_name": "demo",
+            "owner_dob": "2021-05-28",
+            "aadhaar_number": null,
+            "aadhaar_front": "/media/kyc/aadhaar/Screenshot_52.png",
+            "aadhaar_back": "/media/kyc/aadhaar/Screenshot_55.png",
+            "owner_photo": "/media/kyc/photo/Screenshot_63.png",
+            "address_proof": null,
+            "address_proof_copy": "/media/kyc/address/Screenshot_61.png",
+            "authorized_signatory_name": "amisha",
+            "signatory_pan": "shekhawat",
+            "signatory_pan_copy": "/media/signatory/pan/Screenshot_46.png",
+            "board_resolution": null,
+            "partnership_deed": null,
+            "llp_agreement": null,
+            "firm_type": "Company",
+            "bank_account_name": "Amit Sharma",
+            "bank_name": "State Bank of India",
+            "account_number": null,
+            "ifsc_code": "SBIN0001234",
+            "branch_name": "Andheri East",
+            "cancelled_cheque": "/media/cancelled_cheques/Screenshot_2026-04-29_155443.png",
+            "credit_limit": "50000.00",
+            "payment_terms_days": 7,
+            "warehouse_available": true,
+            "warehouse_address": "abcdd",
+            "storage_area_sqft": 2,
+            "logistics_partner": "thief",
+            "monthly_distribution_capacity": 1,
+            "service_cities": "jaipur bikaner",
+            "agreement_signed": true,
+            "agreement_copy": "/media/agreements/Screenshot_63.png",
+            "kyc_verified": false,
+            "kyc_verified_by": "amisha",
+            "kyc_verified_date": "2026-04-30T11:08:39.234134Z",
+            "remarks": "sdaf",
+            "created_at": "2026-04-30T11:08:39.234165Z",
+            "updated_at": "2026-04-30T12:02:02.796118Z",
+            "region": nul
+]
+
+In Salary Payment  API  employee id with employee name shown
+
+19/05/26
+
+In Category Target Report API:-
+Download Excel
+Get:-https://apidata.hogoautofilms.co.in/category-target-report-excel/?category_id=3
+fiter by month
+Get:-https://apidata.hogoautofilms.co.in/category-target-report-excel/?category_id=2&month=2026-02
+
+In Distributor Target Report API:-
+Download Excel
+GET:-https://apidata.hogoautofilms.co.in/distributor-target-report-excel/?distributor_id=18
+fiter by month
+Get:-https://apidata.hogoautofilms.co.in/distributor-target-report-excel/?distributor_id=18&month=2026-02
+
+In Product Target Report API:-
+Download Excel
+GET:-https://apidata.hogoautofilms.co.in/product-target-report-excel/?product_id=18?product_id=18
+fiter by month
+Get:-https://apidata.hogoautofilms.co.in/product-target-report-excel/?product_id=18?product_id=2&month=2026-
+
+
+
+Employee Forgot password
+
+post:-https://hogofilm.pythonanywhere.com/employee-forgot-password/
+
+email:-rupalirajput834@gmail.com   <-----pass registered email
+employee:-47        <----pass employee_id
+
+patch:-https://hogofilm.pythonanywhere.com/employee-forgot-password/
+
+email:-rupalirajput834@gmail.com   <-----pass registered email
+employee:-47                        <----pass employee_id
+otp:-234546                          <----otp access in registerd email
+new_password:-123456
+confirm_password:-123456
+
+
+
+29/05/2026
+Testimonial API
+GET:-https://apidata.hogoautofilms.co.in/testimonials/
+POST:-https://apidata.hogoautofilms.co.in/testimonials/
+PATCH:-https://apidata.hogoautofilms.co.in/testimonials/1/  <---pass testimonial Id
+DELETE:-https://apidata.hogoautofilms.co.in/testimonials/1/ <----pass testimonial Id
+
+FORMATE[
+            "id": 1,
+            "name": "Python Django",
+            "image": "/media/testimonial/Back.jpeg",
+            "description": "python is a high level programming Langaugae",
+            "rating": 4,
+            "created_at": "2026-05-29T06:07:23.474790Z"
+]
+
+02/06/2026
+Shipment Product Excel Download
+GET:-https://apidata.hogoautofilms.co.in/shipment-product-excel-download/
+filter by batch_id
+GET:-https://apidata.hogoautofilms.co.in/shipment-product-excel-download/?batch_id=111
+filter by start_date&end_date
+GET:-https://apidata.hogoautofilms.co.in/shipment-product-excel-download/?start_date=2026-06-02&end_date=2026-06-02
+filter by product_name
+GET:-https://apidata.hogoautofilms.co.in/shipment-product-excel-download/?product_name=Yuva - Gloss 6 Years
+
+
+All Categoties excel Download
+GET:-https://apidata.hogoautofilms.co.in/all-category-target-report-excel/
+filter by year
+GET:-https://apidata.hogoautofilms.co.in/all-category-target-report-excel/?year=2027
+
+
+All Product excel download
+GET:-https://apidata.hogoautofilms.co.in/all-product-target-report-excel/
+filter by year
+GET:-https://apidata.hogoautofilms.co.in/all-product-target-report-excel/?year=2027
+
+
+All Distributor excel Download
+GET:-https://apidata.hogoautofilms.co.in/all-distributor-target-report-excel/
+filter by year
+GET:-https://apidata.hogoautofilms.co.in/all-product-target-report-excel/?year=2027
+
+
+All Region excel  Download
+GET:-https://apidata.hogoautofilms.co.in/all-region-target-report-excel/
+filter by year
+GET:-https://apidata.hogoautofilms.co.in/all-region-target-report-excel/?year=2027
