@@ -12057,7 +12057,6 @@ class CategoryTargetReportExcelAPIView(APIView):
         return None
 
     def _parse_items(self, raw):
-        """Handles product_items as list OR json string."""
         if not raw:
             return []
         if isinstance(raw, list):
@@ -12070,8 +12069,24 @@ class CategoryTargetReportExcelAPIView(APIView):
                 return []
         return []
 
+    def _get_base_price(self, item, product):
+        for key in ["unit_distributor_price", "mrp", "unit_price", "price"]:
+            val = item.get(key)
+            if val not in [None, "", "null", 0, "0", "0.00"]:
+                try:
+                    return Decimal(str(val))
+                except Exception:
+                    pass
+        mrp = getattr(product, "mrp", None)
+        if mrp not in [None, "", "null"]:
+            try:
+                return Decimal(str(mrp))
+            except Exception:
+                pass
+        return Decimal("0.00")
+
     def _parse_year_month(self, year_value, month_value):
-        year = datetime.now().year
+        year           = datetime.now().year
         selected_month = None
 
         if year_value:
@@ -12085,10 +12100,10 @@ class CategoryTargetReportExcelAPIView(APIView):
                 if len(month_value) == 2:
                     selected_month = int(month_value)
                 elif len(month_value) == 7:
-                    parsed = datetime.strptime(month_value, "%Y-%m")
+                    parsed         = datetime.strptime(month_value, "%Y-%m")
                     year, selected_month = parsed.year, parsed.month
                 elif len(month_value) == 10:
-                    parsed = datetime.strptime(month_value, "%Y-%m-%d")
+                    parsed         = datetime.strptime(month_value, "%Y-%m-%d")
                     year, selected_month = parsed.year, parsed.month
                 else:
                     return None, None, {
@@ -12112,33 +12127,27 @@ class CategoryTargetReportExcelAPIView(APIView):
             category_target.target if category_target else 0
         )
 
+        product_map   = {str(p.id): p for p in products}
+        product_ids   = set(product_map.keys())
         product_total = Decimal("0.00")
         order_total   = Decimal("0.00")
         invoice_total = Decimal("0.00")
-
-        # build price map once per category
-        price_map = {}
-        for product in products:
-            base_price = self._to_decimal(
-                getattr(product, "unit_distributor_price", 0)
-            )
-            if base_price <= 0:
-                base_price = self._to_decimal(getattr(product, "mrp", 0))
-            price_map[str(product.id)] = base_price
 
         for po in month_pos:
             for item in self._parse_items(po.product_items):
                 if not isinstance(item, dict):
                     continue
                 pid = self._get_item_product_id(item)
-                if pid not in price_map:
+                if not pid or pid not in product_ids:
                     continue
                 qty = self._to_decimal(
                     item.get("quantity", item.get("qty", 0))
                 )
                 if qty <= 0:
                     continue
-                order_amt      = qty * price_map[pid]
+                product        = product_map[pid]
+                base_price     = self._get_base_price(item, product)
+                order_amt      = qty * base_price
                 product_total += qty
                 order_total   += order_amt
                 invoice_total += order_amt * (Decimal("1") + GST)
@@ -12155,9 +12164,9 @@ class CategoryTargetReportExcelAPIView(APIView):
     CENTER      = Alignment(horizontal="center", vertical="center")
     LEFT        = Alignment(horizontal="left",   vertical="center")
 
+    # ✅ Category column removed
     HEADERS = [
         "SR No",
-        "Category",
         "Month",
         "Target",
         "Total Product",
@@ -12188,10 +12197,7 @@ class CategoryTargetReportExcelAPIView(APIView):
         month_value = request.GET.get("month")
         year_value  = request.GET.get("year")
 
-        # ---- parse year / month ------------------------------------
-        year, selected_month, err = self._parse_year_month(
-            year_value, month_value
-        )
+        year, selected_month, err = self._parse_year_month(year_value, month_value)
         if err:
             return Response(err, status=status.HTTP_400_BAD_REQUEST)
 
@@ -12199,9 +12205,6 @@ class CategoryTargetReportExcelAPIView(APIView):
             [selected_month] if selected_month else range(1, 13)
         )
 
-        # ---- resolve categories ------------------------------------
-        # If category_id is given  → single category Excel
-        # If no category_id        → all categories in one Excel
         if category_id:
             categories = Category.objects.filter(id=category_id)
             if not categories.exists():
@@ -12217,24 +12220,22 @@ class CategoryTargetReportExcelAPIView(APIView):
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
-        # ---- build title text from category names ------------------
         cat_list  = list(categories)
         cat_names = [c.name for c in cat_list if c.name]
 
-        if len(cat_names) <= 4:
-            title_prefix = ", ".join(cat_names)
-        else:
-            title_prefix = f"All Categories ({len(cat_names)})"
+        title_prefix = (
+            ", ".join(cat_names)
+            if len(cat_names) <= 4
+            else f"All Categories ({len(cat_names)})"
+        )
 
-        if selected_month:
-            report_title = (
-                f"{title_prefix} | Target Report - "
-                f"{calendar.month_name[selected_month]} {year}"
-            )
-        else:
-            report_title = f"{title_prefix} | Target Report - {year}"
+        report_title = (
+            f"{title_prefix} | Target Report - "
+            f"{calendar.month_name[selected_month]} {year}"
+            if selected_month
+            else f"{title_prefix} | Target Report - {year}"
+        )
 
-        # ---- purchase orders (fetched ONCE for the year) -----------
         purchase_orders = PurchaseOrder.objects.filter(
             Q(po_date__year=year)
             | Q(po_date__isnull=True, created_at__year=year)
@@ -12243,25 +12244,24 @@ class CategoryTargetReportExcelAPIView(APIView):
         # ---------------------------------------------------------------- #
         # WORKBOOK
         # ---------------------------------------------------------------- #
+
         workbook = Workbook()
         ws       = workbook.active
         ws.title = "Category Target Report"
 
         last_col = len(self.HEADERS)
 
-        # ---- ROW 1 : Title -----------------------------------------
+        # Row 1 — Title
         ws.merge_cells(f"A1:{get_column_letter(last_col)}1")
-        self._style_cell(
-            ws["A1"], report_title,
-            bold=True, fill=self.RED_FILL,
-            font_color="FFFFFF"
-        )
-        ws["A1"].font = Font(bold=True, size=14, color="FFFFFF")
+        ws["A1"].value     = report_title
+        ws["A1"].font      = Font(bold=True, size=14, color="FFFFFF")
+        ws["A1"].fill      = self.RED_FILL
+        ws["A1"].alignment = self.CENTER
 
-        # ---- ROW 2 : blank spacer ----------------------------------
+        # Row 2 — spacer
         ws.row_dimensions[2].height = 6
 
-        # ---- ROW 3 : Headers ---------------------------------------
+        # Row 3 — Headers
         for col, header in enumerate(self.HEADERS, 1):
             self._style_cell(
                 ws.cell(row=3, column=col), header,
@@ -12272,6 +12272,7 @@ class CategoryTargetReportExcelAPIView(APIView):
         # ---------------------------------------------------------------- #
         # DATA ROWS
         # ---------------------------------------------------------------- #
+
         row_num = 4
         sr_no   = 1
 
@@ -12284,37 +12285,26 @@ class CategoryTargetReportExcelAPIView(APIView):
 
         for category_obj in cat_list:
 
-            products = list(
-                Product.objects.filter(category_id=category_obj.id)
-            )
+            products = list(Product.objects.filter(category_id=category_obj.id))
             if not products:
                 continue
-
-            category_name = category_obj.name or "Category"
 
             cat_target  = Decimal("0.00")
             cat_product = Decimal("0.00")
             cat_order   = Decimal("0.00")
             cat_invoice = Decimal("0.00")
 
-            # ---- month rows for this category ----------------------
             for month in months_to_loop:
 
-                month_name = (
-                    calendar.month_abbr[month]
-                    + f"-{str(year)[-2:]}"
-                )
+                month_name = calendar.month_abbr[month] + f"-{str(year)[-2:]}"
 
                 month_pos = purchase_orders.filter(
                     Q(po_date__month=month)
                     | Q(po_date__isnull=True, created_at__month=month)
                 )
 
-                m_target, m_product, m_order, m_invoice = (
-                    self._calc_month_data(
-                        category_obj.id, products,
-                        month_pos, year, month
-                    )
+                m_target, m_product, m_order, m_invoice = self._calc_month_data(
+                    category_obj.id, products, month_pos, year, month
                 )
 
                 cat_target  += m_target
@@ -12322,53 +12312,46 @@ class CategoryTargetReportExcelAPIView(APIView):
                 cat_order   += m_order
                 cat_invoice += m_invoice
 
-                # SR No
-                ws.cell(row=row_num, column=1).value = sr_no
+                # ✅ Col 1: SR No
+                ws.cell(row=row_num, column=1).value     = sr_no
                 ws.cell(row=row_num, column=1).alignment = self.CENTER
 
-                # Category
-                ws.cell(row=row_num, column=2).value = category_name
-                ws.cell(row=row_num, column=2).alignment = self.LEFT
+                # ✅ Col 2: Month (was col 3 before)
+                ws.cell(row=row_num, column=2).value     = month_name
+                ws.cell(row=row_num, column=2).alignment = self.CENTER
 
-                # Month
-                ws.cell(row=row_num, column=3).value = month_name
-                ws.cell(row=row_num, column=3).alignment = self.CENTER
-
-                # Numeric columns
+                # ✅ Cols 3-6: numeric values
                 for col, val in zip(
-                    range(4, 8),
+                    range(3, 7),
                     [m_target, m_product, m_order, m_invoice]
                 ):
-                    cell = ws.cell(row=row_num, column=col)
-                    cell.value          = float(val.quantize(Decimal("0.01")))
-                    cell.number_format  = "#,##0.00"
-                    cell.alignment      = self.CENTER
+                    cell               = ws.cell(row=row_num, column=col)
+                    cell.value         = float(val.quantize(Decimal("0.01")))
+                    cell.number_format = "#,##0.00"
+                    cell.alignment     = self.CENTER
 
                 row_num      += 1
                 sr_no        += 1
                 rows_written += 1
 
-            # ---- category subtotal row (gray) ----------------------
-            ws.cell(row=row_num, column=1).value = None
-            ws.cell(row=row_num, column=2).value = f"{category_name} - Subtotal"
-            ws.cell(row=row_num, column=2).alignment = self.LEFT
-            ws.cell(row=row_num, column=2).font = Font(bold=True)
-            ws.cell(row=row_num, column=2).fill = self.GRAY_FILL
-            ws.cell(row=row_num, column=3).value = None
+            # ✅ Subtotal row
+            ws.cell(row=row_num, column=2).value     = "Subtotal"
+            ws.cell(row=row_num, column=2).alignment = self.CENTER
+            ws.cell(row=row_num, column=2).font      = Font(bold=True)
+            ws.cell(row=row_num, column=2).fill      = self.GRAY_FILL
 
             for col, val in zip(
-                range(4, 8),
+                range(3, 7),
                 [cat_target, cat_product, cat_order, cat_invoice]
             ):
-                cell = ws.cell(row=row_num, column=col)
+                cell               = ws.cell(row=row_num, column=col)
                 cell.value         = float(val.quantize(Decimal("0.01")))
                 cell.number_format = "#,##0.00"
                 cell.font          = Font(bold=True)
                 cell.fill          = self.GRAY_FILL
                 cell.alignment     = self.CENTER
 
-            # fill remaining cells in subtotal row gray
-            for col in [1, 3]:
+            for col in [1, 2]:
                 ws.cell(row=row_num, column=col).fill = self.GRAY_FILL
 
             row_num += 1  # subtotal
@@ -12379,43 +12362,36 @@ class CategoryTargetReportExcelAPIView(APIView):
             all_grand_order   += cat_order
             all_grand_invoice += cat_invoice
 
-        # ---- guard -------------------------------------------------
         if rows_written == 0:
             return Response(
-                {
-                    "success": False,
-                    "message": "No products found for the selected category"
-                },
+                {"success": False, "message": "No products found for the selected category"},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # ---- Grand Total row (yellow) — only when all categories ---
+        # ✅ Grand Total row (only when all categories)
         if not category_id:
-            ws.cell(row=row_num, column=2).value = "GRAND TOTAL"
-            ws.cell(row=row_num, column=2).alignment = self.LEFT
+            ws.cell(row=row_num, column=2).value     = "GRAND TOTAL"
+            ws.cell(row=row_num, column=2).alignment = self.CENTER
+            ws.cell(row=row_num, column=2).font      = Font(bold=True)
+            ws.cell(row=row_num, column=2).fill      = self.YELLOW_FILL
 
             for col, val in zip(
-                range(4, 8),
-                [
-                    all_grand_target,
-                    all_grand_product,
-                    all_grand_order,
-                    all_grand_invoice,
-                ]
+                range(3, 7),
+                [all_grand_target, all_grand_product, all_grand_order, all_grand_invoice]
             ):
-                cell = ws.cell(row=row_num, column=col)
+                cell               = ws.cell(row=row_num, column=col)
                 cell.value         = float(val.quantize(Decimal("0.01")))
                 cell.number_format = "#,##0.00"
                 cell.font          = Font(bold=True)
                 cell.fill          = self.YELLOW_FILL
                 cell.alignment     = self.CENTER
 
-            for col in [1, 2, 3]:
-                c = ws.cell(row=row_num, column=col)
+            for col in [1, 2]:
+                c      = ws.cell(row=row_num, column=col)
                 c.fill = self.YELLOW_FILL
                 c.font = Font(bold=True)
 
-        # ---- auto column width -------------------------------------
+        # Auto column widths
         for col in range(1, ws.max_column + 1):
             max_len    = 0
             col_letter = get_column_letter(col)
@@ -12426,8 +12402,9 @@ class CategoryTargetReportExcelAPIView(APIView):
             ws.column_dimensions[col_letter].width = max_len + 5
 
         # ---------------------------------------------------------------- #
-        # HTTP RESPONSE
+        # RESPONSE
         # ---------------------------------------------------------------- #
+
         response = HttpResponse(
             content_type=(
                 "application/vnd.openxmlformats-"
@@ -12441,26 +12418,21 @@ class CategoryTargetReportExcelAPIView(APIView):
                 .replace(" ", "_")
                 .replace("/", "_")
             )
-            if selected_month:
-                file_name = (
-                    f"{safe_name}_{year}_{selected_month}_report.xlsx"
-                )
-            else:
-                file_name = f"{safe_name}_target_report_{year}.xlsx"
+            file_name = (
+                f"{safe_name}_{year}_{selected_month}_report.xlsx"
+                if selected_month
+                else f"{safe_name}_target_report_{year}.xlsx"
+            )
         else:
-            if selected_month:
-                file_name = (
-                    f"all_categories_{year}_{selected_month}_report.xlsx"
-                )
-            else:
-                file_name = f"all_categories_target_report_{year}.xlsx"
+            file_name = (
+                f"all_categories_{year}_{selected_month}_report.xlsx"
+                if selected_month
+                else f"all_categories_target_report_{year}.xlsx"
+            )
 
-        response["Content-Disposition"] = (
-            f'attachment; filename="{file_name}"'
-        )
+        response["Content-Disposition"] = f'attachment; filename="{file_name}"'
         workbook.save(response)
         return response
-    
     
 class DistributorTargetReportAPIView(APIView):
 
@@ -13270,7 +13242,7 @@ from rest_framework.views import APIView
 class DistributorTargetReportExcelAPIView(APIView):
 
     # ------------------------------------------------------------------ #
-    # HELPERS                                                            #
+    # HELPERS
     # ------------------------------------------------------------------ #
 
     def _to_decimal(self, value, default="0.00"):
@@ -13286,8 +13258,44 @@ class DistributorTargetReportExcelAPIView(APIView):
             self._to_decimal(value).quantize(Decimal("0.01"))
         )
 
+    def _get_base_price(self, item, product_map):
+        """
+        ✅ Same priority order as the API view:
+        1. PO item-level prices first
+        2. Fall back to product.mrp from product_map
+        """
+        for key in ["unit_distributor_price", "mrp", "unit_price", "price"]:
+            val = item.get(key)
+            if val not in [None, "", "null", 0, "0", "0.00"]:
+                try:
+                    d = Decimal(str(val))
+                    if d > 0:
+                        return d
+                except Exception:
+                    pass
+
+        # Fall back to product.mrp via product_map
+        pid = None
+        for key in ["product_id", "product", "id"]:
+            v = item.get(key)
+            if v not in [None, "", "null"]:
+                pid = str(v.get("id") if isinstance(v, dict) else v)
+                break
+
+        if pid and pid in product_map:
+            mrp = getattr(product_map[pid], "mrp", None)
+            if mrp not in [None, "", "null"]:
+                try:
+                    d = Decimal(str(mrp))
+                    if d > 0:
+                        return d
+                except Exception:
+                    pass
+
+        return Decimal("0.00")
+
     # ------------------------------------------------------------------ #
-    # SHARED STYLES                                                      #
+    # SHARED STYLES
     # ------------------------------------------------------------------ #
 
     RED_FILL    = PatternFill(fill_type="solid", start_color="C00000", end_color="C00000")
@@ -13295,7 +13303,7 @@ class DistributorTargetReportExcelAPIView(APIView):
     CENTER      = Alignment(horizontal="center", vertical="center")
 
     # ------------------------------------------------------------------ #
-    # AUTO COLUMN WIDTH                                                  #
+    # AUTO COLUMN WIDTH
     # ------------------------------------------------------------------ #
 
     def _auto_width(self, ws):
@@ -13310,8 +13318,7 @@ class DistributorTargetReportExcelAPIView(APIView):
             ws.column_dimensions[get_column_letter(col)].width = max_length + 5
 
     # ------------------------------------------------------------------ #
-    # WRITE ONE DISTRIBUTOR BLOCK                                        #
-    # Returns the next available row after the block.                    #
+    # WRITE ONE DISTRIBUTOR BLOCK
     # ------------------------------------------------------------------ #
 
     def _write_distributor_block(
@@ -13328,15 +13335,12 @@ class DistributorTargetReportExcelAPIView(APIView):
             end_row=row,   end_column=6,
         )
         title_cell = ws.cell(row=row, column=1)
-
-        if selected_month:
-            title_cell.value = (
-                f"{distributor_name} Target Report - "
-                f"{calendar.month_name[selected_month]} {year}"
-            )
-        else:
-            title_cell.value = f"{distributor_name} Target Report - {year}"
-
+        title_cell.value = (
+            f"{distributor_name} Target Report - "
+            f"{calendar.month_name[selected_month]} {year}"
+            if selected_month
+            else f"{distributor_name} Target Report - {year}"
+        )
         title_cell.font      = Font(bold=True, size=14, color="FFFFFF")
         title_cell.fill      = self.RED_FILL
         title_cell.alignment = self.CENTER
@@ -13351,15 +13355,32 @@ class DistributorTargetReportExcelAPIView(APIView):
             "Order (Excl GST)",
             "Invoice (Incl GST)",
         ]
-
         for col, h in enumerate(headers, 1):
             cell           = ws.cell(row=row, column=col)
             cell.value     = h
             cell.font      = Font(bold=True, color="FFFFFF")
             cell.fill      = self.RED_FILL
             cell.alignment = self.CENTER
-
         row += 1
+
+        # ── Pre-build product map for price fallback ───────────────────
+        # Get all product IDs referenced in this distributor's POs
+        all_product_ids = set()
+        for po in purchase_orders_qs:
+            for item in (po.product_items or []):
+                if not isinstance(item, dict):
+                    continue
+                for key in ["product_id", "product", "id"]:
+                    v = item.get(key)
+                    if v not in [None, "", "null"]:
+                        pid = str(v.get("id") if isinstance(v, dict) else v)
+                        all_product_ids.add(pid)
+                        break
+
+        product_map = {
+            str(p.id): p
+            for p in Product.objects.filter(id__in=all_product_ids)
+        } if all_product_ids else {}
 
         # ── Data rows ──────────────────────────────────────────────────
         sr_no         = 1
@@ -13372,9 +13393,7 @@ class DistributorTargetReportExcelAPIView(APIView):
 
         for m in months:
 
-            month_label = (
-                calendar.month_abbr[m] + f"-{str(year)[-2:]}"
-            )
+            month_label = calendar.month_abbr[m] + f"-{str(year)[-2:]}"
 
             # Target
             target_obj = DistributorInformation_Target.objects.filter(
@@ -13382,7 +13401,6 @@ class DistributorTargetReportExcelAPIView(APIView):
                 month__year=year,
                 month__month=m,
             ).first()
-
             month_target = self._to_decimal(
                 target_obj.target if target_obj else 0
             )
@@ -13399,19 +13417,23 @@ class DistributorTargetReportExcelAPIView(APIView):
 
             for po in month_orders:
                 for item in (po.product_items or []):
-                    if isinstance(item, dict):
-                        qty  = self._to_decimal(item.get("quantity", 0))
-                        base = self._to_decimal(
-                            item.get("unit_price")
-                            or item.get("price")
-                            or item.get("mrp")
-                            or 0
-                        )
-                        order_amt      = qty * base
-                        invoice_amt    = order_amt * Decimal("1.18")
-                        month_product += qty
-                        month_order   += order_amt
-                        month_invoice += invoice_amt
+                    if not isinstance(item, dict):
+                        continue
+
+                    qty = self._to_decimal(
+                        item.get("quantity", item.get("qty", 0))
+                    )
+                    if qty <= 0:
+                        continue
+
+                    # ✅ Use same price priority as API view
+                    base = self._get_base_price(item, product_map)
+
+                    order_amt      = qty * base
+                    invoice_amt    = order_amt * Decimal("1.18")
+                    month_product += qty
+                    month_order   += order_amt
+                    month_invoice += invoice_amt
 
             grand_target  += month_target
             grand_product += month_product
@@ -13439,8 +13461,7 @@ class DistributorTargetReportExcelAPIView(APIView):
             sr_no += 1
 
         # ── Total row ──────────────────────────────────────────────────
-        ws.cell(row=row, column=1).value = ""
-        ws.cell(row=row, column=1).fill  = self.YELLOW_FILL
+        ws.cell(row=row, column=1).fill = self.YELLOW_FILL
 
         total_label           = ws.cell(row=row, column=2)
         total_label.value     = "TOTAL"
@@ -13461,19 +13482,18 @@ class DistributorTargetReportExcelAPIView(APIView):
             cell.fill          = self.YELLOW_FILL
             cell.alignment     = self.CENTER
 
-        # 2-row gap between distributor blocks
         return row + 2
 
     # ------------------------------------------------------------------ #
-    # MAIN GET                                                            #
+    # MAIN GET
     # ------------------------------------------------------------------ #
 
     def get(self, request):
 
-        distributor_id = request.GET.get("distributor_id")  # optional — omit for ALL
+        distributor_id = request.GET.get("distributor_id")
         month_value    = request.GET.get("month")
         year_value     = request.GET.get("year")
-        sheet_mode     = request.GET.get("mode", "multi")   # "multi" | "single"
+        sheet_mode     = request.GET.get("mode", "multi")
 
         # ── Year ───────────────────────────────────────────────────────
         year           = datetime.now().year
@@ -13493,17 +13513,14 @@ class DistributorTargetReportExcelAPIView(APIView):
             try:
                 if len(month_value) == 2:
                     selected_month = int(month_value)
-
                 elif len(month_value) == 7:
                     parsed         = datetime.strptime(month_value, "%Y-%m")
                     year           = parsed.year
                     selected_month = parsed.month
-
                 elif len(month_value) == 10:
                     parsed         = datetime.strptime(month_value, "%Y-%m-%d")
                     year           = parsed.year
                     selected_month = parsed.month
-
                 else:
                     return Response(
                         {"success": False, "message": "Use MM, YYYY-MM, or YYYY-MM-DD"},
@@ -13534,10 +13551,9 @@ class DistributorTargetReportExcelAPIView(APIView):
 
         # ── Build workbook ─────────────────────────────────────────────
         wb = Workbook()
-        wb.remove(wb.active)  # remove default blank sheet
+        wb.remove(wb.active)
 
         if sheet_mode == "single":
-            # All distributors stacked on one sheet
             ws          = wb.create_sheet(title="All Distributors Report")
             current_row = 1
 
@@ -13562,7 +13578,6 @@ class DistributorTargetReportExcelAPIView(APIView):
             self._auto_width(ws)
 
         else:
-            # One sheet per distributor (default)
             for dist in distributors:
                 dist_name = (
                     getattr(dist, "distributor_name", None)
@@ -13571,12 +13586,9 @@ class DistributorTargetReportExcelAPIView(APIView):
                 )
                 safe_title = (
                     str(dist_name)[:31]
-                    .replace("/", "_")
-                    .replace("\\", "_")
-                    .replace("*", "_")
-                    .replace("?", "_")
-                    .replace("[", "_")
-                    .replace("]", "_")
+                    .replace("/", "_").replace("\\", "_")
+                    .replace("*", "_").replace("?",  "_")
+                    .replace("[", "_").replace("]",  "_")
                 )
                 ws = wb.create_sheet(title=safe_title)
 
@@ -13601,7 +13613,6 @@ class DistributorTargetReportExcelAPIView(APIView):
             )
         )
 
-        # File name
         if distributor_id and distributors.count() == 1:
             dist      = distributors.first()
             dist_name = (
@@ -13609,21 +13620,18 @@ class DistributorTargetReportExcelAPIView(APIView):
                 or getattr(dist, "company_name", None)
                 or str(dist)
             )
-            safe_name = (
-                str(dist_name)
-                .replace(" ", "_")
-                .replace("/", "_")
+            safe_name = str(dist_name).replace(" ", "_").replace("/", "_")
+            file_name = (
+                f"{safe_name}_{year}_{selected_month:02d}_report.xlsx"
+                if selected_month
+                else f"{safe_name}_target_report_{year}.xlsx"
             )
-            if selected_month:
-                file_name = f"{safe_name}_{year}_{selected_month:02d}_report.xlsx"
-            else:
-                file_name = f"{safe_name}_target_report_{year}.xlsx"
         else:
             file_name = f"all_distributors_target_report_{year}.xlsx"
 
         response["Content-Disposition"] = f'attachment; filename="{file_name}"'
         wb.save(response)
-        return response   
+        return response
  
 class ProductTargetReportAPIView(APIView):
 
@@ -13851,219 +13859,152 @@ class ProductTargetReportExcelAPIView(APIView):
     # SAFE DECIMAL
     # --------------------------------
     def _to_decimal(self, value, default="0.00"):
-
         try:
-
             if value in [None, "", "null"]:
                 return Decimal(default)
-
             return Decimal(str(value))
-
         except (InvalidOperation, TypeError, ValueError):
-
             return Decimal(default)
 
     # --------------------------------
     # FLOAT FORMAT
     # --------------------------------
     def _to_float(self, value):
-
         return float(
-            self._to_decimal(value).quantize(
-                Decimal("0.01")
-            )
+            self._to_decimal(value).quantize(Decimal("0.01"))
         )
+
+    # --------------------------------
+    # ✅ BASE PRICE — same priority as API view
+    # --------------------------------
+    def _get_base_price(self, item, product_obj):
+        for key in ["unit_distributor_price", "mrp", "unit_price", "price"]:
+            val = item.get(key)
+            if val not in [None, "", "null", 0, "0", "0.00"]:
+                try:
+                    d = Decimal(str(val))
+                    if d > 0:
+                        return d
+                except Exception:
+                    pass
+
+        # Fall back to product.mrp
+        mrp = getattr(product_obj, "mrp", None)
+        if mrp not in [None, "", "null"]:
+            try:
+                d = Decimal(str(mrp))
+                if d > 0:
+                    return d
+            except Exception:
+                pass
+
+        return Decimal("0.00")
 
     # --------------------------------
     # MAIN API
     # --------------------------------
     def get(self, request):
 
-        product_id = request.GET.get("product_id")
+        product_id  = request.GET.get("product_id")
         month_value = request.GET.get("month")
-        year_value = request.GET.get("year")
+        year_value  = request.GET.get("year")
 
         if not product_id:
-
             return Response(
-                {
-                    "success": False,
-                    "message": "product_id is required"
-                },
+                {"success": False, "message": "product_id is required"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         # --------------------------------
-        # DATE PARSE
+        # YEAR
         # --------------------------------
-        current_date = datetime.now()
-
-        # DEFAULT YEAR
-        year = current_date.year
+        year           = datetime.now().year
         selected_month = None
 
-        # --------------------------------
-        # YEAR FILTER
-        # --------------------------------
         if year_value:
-
             try:
-
                 year = int(year_value)
-
             except ValueError:
-
                 return Response(
-                    {
-                        "success": False,
-                        "message": "Invalid year format"
-                    },
+                    {"success": False, "message": "Invalid year format"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
         # --------------------------------
-        # MONTH FILTER
+        # MONTH
         # --------------------------------
         if month_value:
-
             try:
-
-                # MM
                 if len(month_value) == 2:
-
                     selected_month = int(month_value)
-
-                # YYYY-MM
                 elif len(month_value) == 7:
-
-                    parsed = datetime.strptime(
-                        month_value,
-                        "%Y-%m"
-                    )
-
-                    year = parsed.year
+                    parsed         = datetime.strptime(month_value, "%Y-%m")
+                    year           = parsed.year
                     selected_month = parsed.month
-
-                # YYYY-MM-DD
                 elif len(month_value) == 10:
-
-                    parsed = datetime.strptime(
-                        month_value,
-                        "%Y-%m-%d"
-                    )
-
-                    year = parsed.year
+                    parsed         = datetime.strptime(month_value, "%Y-%m-%d")
+                    year           = parsed.year
                     selected_month = parsed.month
-
                 else:
-
                     return Response(
-                        {
-                            "success": False,
-                            "message": (
-                                "Use MM or YYYY-MM "
-                                "or YYYY-MM-DD"
-                            )
-                        },
+                        {"success": False, "message": "Use MM or YYYY-MM or YYYY-MM-DD"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
-
             except ValueError:
-
                 return Response(
-                    {
-                        "success": False,
-                        "message": "Invalid month format"
-                    },
+                    {"success": False, "message": "Invalid month format"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
         # --------------------------------
         # PRODUCT
         # --------------------------------
-        product_obj = Product.objects.filter(
-            id=product_id
-        ).first()
+        product_obj = Product.objects.filter(id=product_id).first()
 
         if not product_obj:
-
             return Response(
-                {
-                    "success": False,
-                    "message": "Product not found"
-                },
+                {"success": False, "message": "Product not found"},
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        product_name = (
-            getattr(
-                product_obj,
-                "product_name",
-                None
-            )
-            or str(product_obj)
-        )
+        product_name = getattr(product_obj, "product_name", None) or str(product_obj)
 
         # --------------------------------
         # PURCHASE ORDERS
         # --------------------------------
         purchase_orders = PurchaseOrder.objects.filter(
             Q(po_date__year=year) |
-            Q(
-                po_date__isnull=True,
-                created_at__year=year
-            )
+            Q(po_date__isnull=True, created_at__year=year)
         )
 
         # --------------------------------
         # EXCEL
         # --------------------------------
         wb = Workbook()
-
         ws = wb.active
-
         ws.title = "Product Target Report"
+
+        RED_FILL    = PatternFill(fill_type="solid", start_color="C00000", end_color="C00000")
+        YELLOW_FILL = PatternFill(fill_type="solid", start_color="FFF2CC", end_color="FFF2CC")
+        CENTER      = Alignment(horizontal="center", vertical="center")
 
         # --------------------------------
         # TITLE
         # --------------------------------
-        ws.merge_cells("A1:E1")
-
-        title = ws["A1"]
-
-        if selected_month:
-
-            report_title = (
-                f"{product_name} Target Report - "
-                f"{calendar.month_name[selected_month]} "
-                f"{year}"
-            )
-
-        else:
-
-            report_title = (
-                f"{product_name} Target Report - "
-                f"{year}"
-            )
-
-        title.value = report_title
-
-        title.font = Font(
-            bold=True,
-            size=16,
-            color="FFFFFF"
+        ws.merge_cells("A1:F1")
+        title       = ws["A1"]
+        title.value = (
+            f"{product_name} Target Report - "
+            f"{calendar.month_name[selected_month]} {year}"
+            if selected_month
+            else f"{product_name} Target Report - {year}"
         )
+        title.font      = Font(bold=True, size=16, color="FFFFFF")
+        title.fill      = RED_FILL
+        title.alignment = CENTER
 
-        title.fill = PatternFill(
-            fill_type="solid",
-            start_color="C00000",
-            end_color="C00000"
-        )
-
-        title.alignment = Alignment(
-            horizontal="center",
-            vertical="center"
-        )
+        # Row 2 — spacer
+        ws.row_dimensions[2].height = 6
 
         # --------------------------------
         # HEADERS
@@ -14074,361 +14015,136 @@ class ProductTargetReportExcelAPIView(APIView):
             "Target",
             "Total Product",
             "Order (Excl GST)",
-            "Invoice (Incl GST)"
+            "Invoice (Incl GST)",
         ]
 
-        header_fill = PatternFill(
-            fill_type="solid",
-            start_color="C00000",
-            end_color="C00000"
-        )
-
         for col, h in enumerate(headers, 1):
-
-            cell = ws.cell(
-                row=3,
-                column=col
-            )
-
-            cell.value = h
-
-            cell.font = Font(
-                bold=True,
-                color="FFFFFF"
-            )
-
-            cell.fill = header_fill
-
-            cell.alignment = Alignment(
-                horizontal="center",
-                vertical="center"
-            )
+            cell           = ws.cell(row=3, column=col)
+            cell.value     = h
+            cell.font      = Font(bold=True, color="FFFFFF")
+            cell.fill      = RED_FILL
+            cell.alignment = CENTER
 
         # --------------------------------
         # DATA
         # --------------------------------
-        row = 4
-        sr_no = 1
-
-        total_target = Decimal("0.00")
+        row           = 4
+        sr_no         = 1
+        total_target  = Decimal("0.00")
         total_product = Decimal("0.00")
-        total_order = Decimal("0.00")
+        total_order   = Decimal("0.00")
         total_invoice = Decimal("0.00")
 
-        months = (
-            [selected_month]
-            if selected_month
-            else range(1, 13)
-        )
+        months = [selected_month] if selected_month else range(1, 13)
 
         for m in months:
 
-            # --------------------------------
-            # MONTH NAME
-            # --------------------------------
-            month_name = (
-                calendar.month_abbr[m]
-                + f"-{str(year)[-2:]}"
-            )
+            month_name = calendar.month_abbr[m] + f"-{str(year)[-2:]}"
 
-            # --------------------------------
             # TARGET
-            # --------------------------------
-            target_obj = Product_Target.objects.filter(
+            target_obj   = Product_Target.objects.filter(
                 product_id=product_id,
                 month__year=year,
                 month__month=m
             ).first()
-
             month_target = self._to_decimal(
                 target_obj.target if target_obj else 0
             )
 
-            # --------------------------------
-            # PURCHASE ORDERS FILTER
-            # --------------------------------
-            month_orders = purchase_orders.filter(
+            # ORDERS
+            month_orders        = purchase_orders.filter(
                 Q(po_date__month=m) |
-                Q(
-                    po_date__isnull=True,
-                    created_at__month=m
-                )
+                Q(po_date__isnull=True, created_at__month=m)
             )
             month_product_total = Decimal("0.00")
-            month_order_total = Decimal("0.00")
+            month_order_total   = Decimal("0.00")
             month_invoice_total = Decimal("0.00")
 
-            # --------------------------------
-            # ORDER LOOP
-            # --------------------------------
             for po in month_orders:
-
                 for item in (po.product_items or []):
-
                     if not isinstance(item, dict):
                         continue
 
                     if str(item.get("product_id")) != str(product_id):
                         continue
 
+                    # ✅ qty with fallback + guard
                     qty = self._to_decimal(
-                        item.get("quantity", 0)
+                        item.get("quantity", item.get("qty", 0))
                     )
-                    month_product_total += qty
-                    base = self._to_decimal(
-                        item.get("unit_price")
-                        or item.get("price")
-                        or item.get("mrp")
-                        or 0
-                    )
+                    if qty <= 0:
+                        continue
 
+                    # ✅ price with correct priority
+                    base      = self._get_base_price(item, product_obj)
                     order_amt = qty * base
+                    inv_amt   = order_amt * Decimal("1.18")
 
-                    gst = (
-                        order_amt *
-                        Decimal("0.18")
-                    )
+                    month_product_total += qty
+                    month_order_total   += order_amt
+                    month_invoice_total += inv_amt
 
-                    invoice_amt = order_amt + gst
-
-                    month_order_total += order_amt
-                    month_invoice_total += invoice_amt
-
-            # --------------------------------
-            # GRAND TOTALS
-            # --------------------------------
-            total_target += month_target
+            total_target  += month_target
             total_product += month_product_total
-
-            total_order += month_order_total
+            total_order   += month_order_total
             total_invoice += month_invoice_total
 
-            # --------------------------------
             # WRITE ROW
-            # --------------------------------
-            ws.cell(
-                row=row,
-                column=1
-            ).value = sr_no
+            ws.cell(row=row, column=1).value = sr_no
+            ws.cell(row=row, column=2).value = month_name
 
-            ws.cell(
-                row=row,
-                column=2
-            ).value = month_name
+            for col, val in [
+                (3, month_target),
+                (4, month_product_total),
+                (5, month_order_total),
+                (6, month_invoice_total),
+            ]:
+                cell               = ws.cell(row=row, column=col)
+                cell.value         = self._to_float(val)
+                cell.number_format = "#,##0.00"
 
-            # TARGET
-            cell = ws.cell(
-                row=row,
-                column=3
-            )
-
-            cell.value = self._to_float(
-                month_target
-            )
-
-            cell.number_format = "0.00"
-
-            # TOTAL PRODUCT
-            cell = ws.cell(
-                row=row,
-                column=4
-            )
-
-            cell.value = self._to_float(
-                month_product_total
-            )
-
-            cell.number_format = "0.00"
-
-            # ORDER
-            cell = ws.cell(
-                row=row,
-                column=5
-            )
-
-            cell.value = self._to_float(
-                month_order_total
-            )
-
-            cell.number_format = "0.00"
-
-            # INVOICE
-            cell = ws.cell(
-                row=row,
-                column=6
-            )
-
-            cell.value = self._to_float(
-                month_invoice_total
-            )
-
-            cell.number_format = "0.00"
-
-            # ALIGNMENT
             for c in range(1, 7):
+                ws.cell(row=row, column=c).alignment = CENTER
 
-                ws.cell(
-                    row=row,
-                    column=c
-                ).alignment = Alignment(
-                    horizontal="center",
-                    vertical="center"
-                )
-
-            row += 1
+            row   += 1
             sr_no += 1
 
         # --------------------------------
         # TOTAL ROW
         # --------------------------------
-        total_fill = PatternFill(
-            fill_type="solid",
-            start_color="FFF2CC",
-            end_color="FFF2CC"
-        )
+        ws.cell(row=row, column=1).fill = YELLOW_FILL
 
-        total_label = ws.cell(
-            row=row,
-            column=2
-        )
+        total_label           = ws.cell(row=row, column=2)
+        total_label.value     = "TOTAL"
+        total_label.font      = Font(bold=True)
+        total_label.fill      = YELLOW_FILL
+        total_label.alignment = CENTER
 
-        total_label.value = "TOTAL"
-
-        total_label.font = Font(
-            bold=True
-        )
-
-        total_label.fill = total_fill
-
-        total_label.alignment = Alignment(
-            horizontal="center",
-            vertical="center"
-        )
-
-        # TARGET TOTAL
-        cell = ws.cell(
-            row=row,
-            column=3
-        )
-
-        cell.value = self._to_float(
-            total_target
-        )
-
-        cell.number_format = "0.00"
-
-        cell.font = Font(
-            bold=True
-        )
-
-        cell.fill = total_fill
-
-        cell.alignment = Alignment(
-            horizontal="center",
-            vertical="center"
-        )
-
-        # TOTAL PRODUCT
-        cell = ws.cell(
-            row=row,
-            column=4
-        )
-
-        cell.value = self._to_float(
-            total_product
-        )
-
-        cell.number_format = "0.00"
-
-        cell.font = Font(
-            bold=True
-        )
-
-        cell.fill = total_fill
-
-        cell.alignment = Alignment(
-            horizontal="center",
-            vertical="center"
-        )
-
-        # ORDER TOTAL
-        cell = ws.cell(
-            row=row,
-            column=5
-        )
-
-        cell.value = self._to_float(
-            total_order
-        )
-
-        cell.number_format = "0.00"
-
-        cell.font = Font(
-            bold=True
-        )
-
-        cell.fill = total_fill
-
-        cell.alignment = Alignment(
-            horizontal="center",
-            vertical="center"
-        )
-
-        # INVOICE TOTAL
-        cell = ws.cell(
-            row=row,
-            column=6
-        )
-
-        cell.value = self._to_float(
-            total_invoice
-        )
-
-        cell.number_format = "0.00"
-
-        cell.font = Font(
-            bold=True
-        )
-
-        cell.fill = total_fill
-
-        cell.alignment = Alignment(
-            horizontal="center",
-            vertical="center"
-        )
+        for col, val in [
+            (3, total_target),
+            (4, total_product),
+            (5, total_order),
+            (6, total_invoice),
+        ]:
+            cell               = ws.cell(row=row, column=col)
+            cell.value         = self._to_float(val)
+            cell.number_format = "#,##0.00"
+            cell.font          = Font(bold=True)
+            cell.fill          = YELLOW_FILL
+            cell.alignment     = CENTER
 
         # --------------------------------
         # AUTO WIDTH
         # --------------------------------
-        for col in range(
-            1,
-            ws.max_column + 1
-        ):
-
-            max_length = 0
-
-            col_letter = get_column_letter(col)
-
-            for r in range(
-                1,
-                ws.max_row + 1
-            ):
-
-                val = ws.cell(
-                    row=r,
-                    column=col
-                ).value
-
-                if val is not None:
-
-                    max_length = max(
-                        max_length,
-                        len(str(val))
-                    )
-
-            ws.column_dimensions[
-                col_letter
-            ].width = max_length + 5
+        for col in range(1, ws.max_column + 1):
+            max_length = max(
+                (
+                    len(str(ws.cell(row=r, column=col).value or ""))
+                    for r in range(1, ws.max_row + 1)
+                ),
+                default=0,
+            )
+            ws.column_dimensions[get_column_letter(col)].width = max_length + 5
 
         # --------------------------------
         # RESPONSE
@@ -14440,33 +14156,15 @@ class ProductTargetReportExcelAPIView(APIView):
             )
         )
 
-        safe_name = (
-            str(product_name)
-            .replace(" ", "_")
-            .replace("/", "_")
+        safe_name = str(product_name).replace(" ", "_").replace("/", "_")
+        file_name = (
+            f"{safe_name}_{year}_{selected_month}_report.xlsx"
+            if selected_month
+            else f"{safe_name}_target_report_{year}.xlsx"
         )
 
-        if selected_month:
-
-            file_name = (
-                f"{safe_name}_"
-                f"{year}_{selected_month}_report.xlsx"
-            )
-
-        else:
-
-            file_name = (
-                f"{safe_name}_target_report_{year}.xlsx"
-            )
-
-        response[
-            "Content-Disposition"
-        ] = (
-            f'attachment; filename="{file_name}"'
-        )
-
+        response["Content-Disposition"] = f'attachment; filename="{file_name}"'
         wb.save(response)
-
         return response
 
 class RegionTargetReportAPIView(APIView):
@@ -14696,7 +14394,11 @@ from .models import (
 
 class RegionTargetReportExcelAPIView(APIView):
 
-    gst_rate = Decimal("0.18")
+    GST_RATE = Decimal("0.18")
+
+    # ------------------------------------------------------------------ #
+    # HELPERS
+    # ------------------------------------------------------------------ #
 
     def _to_decimal(self, value, default="0.00"):
         try:
@@ -14706,27 +14408,39 @@ class RegionTargetReportExcelAPIView(APIView):
         except (InvalidOperation, TypeError, ValueError):
             return Decimal(default)
 
-    def _get_order_amount_without_gst(self, item):
-        qty = self._to_decimal(item.get("quantity", 0))
+    def _to_float(self, value):
+        return float(
+            self._to_decimal(value).quantize(Decimal("0.01"))
+        )
 
-        if item.get("total_price") not in [None, "", "null"]:
-            return self._to_decimal(item.get("total_price"))
-        if item.get("subtotal") not in [None, "", "null"]:
-            return self._to_decimal(item.get("subtotal"))
-        if item.get("taxable_amount") not in [None, "", "null"]:
-            return self._to_decimal(item.get("taxable_amount"))
-        if item.get("total_amount") not in [None, "", "null"]:
-            return self._to_decimal(item.get("total_amount"))
-        if item.get("total_distributor_price") not in [None, "", "null"] and self._to_decimal(item.get("total_distributor_price")) > 0:
-            return self._to_decimal(item.get("total_distributor_price"))
-        if item.get("unit_distributor_price") not in [None, "", "null"] and self._to_decimal(item.get("unit_distributor_price")) > 0:
-            return self._to_decimal(item.get("unit_distributor_price")) * qty
-        if item.get("unit_price") not in [None, "", "null"]:
-            return self._to_decimal(item.get("unit_price")) * qty
-        if item.get("price") not in [None, "", "null"]:
-            return self._to_decimal(item.get("price")) * qty
-        if item.get("mrp") not in [None, "", "null"]:
-            return self._to_decimal(item.get("mrp")) * qty
+    def _get_base_price(self, item, product_obj):
+        """
+        ✅ Same priority as all other Excel/API views:
+        1. PO item-level prices first
+        2. Fall back to product.mrp
+        """
+        for key in ["unit_distributor_price", "mrp", "unit_price", "price"]:
+            val = item.get(key)
+            if val not in [None, "", "null", 0, "0", "0.00"]:
+                try:
+                    d = Decimal(str(val))
+                    if d > 0:
+                        return d
+                except Exception:
+                    pass
+
+        # Fall back to product model
+        if product_obj:
+            for attr in ["unit_distributor_price", "mrp"]:
+                val = getattr(product_obj, attr, None)
+                if val not in [None, "", "null"]:
+                    try:
+                        d = Decimal(str(val))
+                        if d > 0:
+                            return d
+                    except Exception:
+                        pass
+
         return Decimal("0.00")
 
     def _get_item_product_id(self, item):
@@ -14738,153 +14452,263 @@ class RegionTargetReportExcelAPIView(APIView):
                 return str(value)
         return None
 
+    # ------------------------------------------------------------------ #
+    # MAIN GET
+    # ------------------------------------------------------------------ #
+
     def get(self, request):
-        region_id = request.GET.get("region_id")
+
+        region_id   = request.GET.get("region_id")
         month_value = request.GET.get("month")
 
         if not region_id:
-            return Response({"message": "region_id required"}, status=400)
+            return Response(
+                {"success": False, "message": "region_id is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        # DATE
+        # ── Date parse ─────────────────────────────────────────────────
         parsed_date = None
         if month_value:
             try:
                 parsed_date = datetime.strptime(month_value, "%Y-%m")
-            except:
-                parsed_date = datetime.strptime(month_value, "%Y-%m-%d")
+            except ValueError:
+                try:
+                    parsed_date = datetime.strptime(month_value, "%Y-%m-%d")
+                except ValueError:
+                    return Response(
+                        {"success": False, "message": "Use YYYY-MM or YYYY-MM-DD"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
 
-        year = parsed_date.year if parsed_date else datetime.now().year
+        year   = parsed_date.year  if parsed_date else datetime.now().year
         months = [parsed_date.month] if parsed_date else range(1, 13)
 
-        # REGION
+        # ── Region ─────────────────────────────────────────────────────
         region_obj = Region.objects.filter(id=region_id).first()
         if not region_obj:
-            return Response({"message": "Region not found"}, status=404)
+            return Response(
+                {"success": False, "message": "Region not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
 
-        # DISTRIBUTORS
+        # ── Distributors & POs ─────────────────────────────────────────
         distributors = DistributorInformation.objects.filter(
             Q(region=region_obj) |
             Q(sales_region=str(region_obj.id)) |
             Q(sales_region__iexact=region_obj.name)
         )
         distributor_ids = list(distributors.values_list("id", flat=True))
-        purchase_orders = PurchaseOrder.objects.filter(distributor_id__in=distributor_ids)
 
+        purchase_orders = PurchaseOrder.objects.filter(
+            distributor_id__in=distributor_ids
+        ).filter(
+            Q(po_date__year=year) |
+            Q(po_date__isnull=True, created_at__year=year)
+        )
+
+        # ── Pre-fetch all products referenced in POs ───────────────────
+        all_product_ids = set()
+        for po in purchase_orders:
+            for item in (po.product_items or []):
+                if not isinstance(item, dict):
+                    continue
+                pid = self._get_item_product_id(item)
+                if pid:
+                    all_product_ids.add(pid)
+
+        product_map = {
+            str(p.id): p
+            for p in Product.objects.filter(id__in=all_product_ids)
+        } if all_product_ids else {}
+
+        # ---------------------------------------------------------------- #
         # EXCEL SETUP
+        # ---------------------------------------------------------------- #
+
         wb = Workbook()
         ws = wb.active
         ws.title = "Region Target Report"
 
+        RED_FILL    = PatternFill(fill_type="solid", start_color="C00000", end_color="C00000")
+        YELLOW_FILL = PatternFill(fill_type="solid", start_color="FFF2CC", end_color="FFF2CC")
+        CENTER      = Alignment(horizontal="center", vertical="center")
+
+        # Title
         ws.merge_cells("A1:F1")
-        ws["A1"] = f"{region_obj.name} Target Report"
-        ws["A1"].font = Font(bold=True, size=16, color="FFFFFF")
-        ws["A1"].fill = PatternFill("solid", start_color="C00000")
-        ws["A1"].alignment = Alignment(horizontal="center")
+        title_cell           = ws["A1"]
+        title_cell.value     = (
+            f"{region_obj.name} Target Report - "
+            f"{calendar.month_name[months[0]]} {year}"
+            if len(months) == 1
+            else f"{region_obj.name} Target Report - {year}"
+        )
+        title_cell.font      = Font(bold=True, size=16, color="FFFFFF")
+        title_cell.fill      = RED_FILL
+        title_cell.alignment = CENTER
 
-        headers = ["Sr No", "Month", "Target", "Total Products", "Order (Excl GST)", "Invoice (Incl GST)"]
+        # Spacer
+        ws.row_dimensions[2].height = 6
+
+        # Headers
+        headers = [
+            "SR No",
+            "Month",
+            "Target",
+            "Total Products",
+            "Order (Excl GST)",
+            "Invoice (Incl GST)",
+        ]
         for col, h in enumerate(headers, 1):
-            cell = ws.cell(row=3, column=col)
-            cell.value = h
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", start_color="C00000")
-            cell.alignment = Alignment(horizontal="center")
+            cell           = ws.cell(row=3, column=col)
+            cell.value     = h
+            cell.font      = Font(bold=True, color="FFFFFF")
+            cell.fill      = RED_FILL
+            cell.alignment = CENTER
 
-        ws.column_dimensions["A"].width = 10
-        ws.column_dimensions["B"].width = 18
-        ws.column_dimensions["C"].width = 20
-        ws.column_dimensions["D"].width = 20
-        ws.column_dimensions["E"].width = 25
-        ws.column_dimensions["F"].width = 25
+        # Column widths
+        for col, width in {1: 10, 2: 18, 3: 20, 4: 20, 5: 25, 6: 25}.items():
+            ws.column_dimensions[get_column_letter(col)].width = width
+
         ws.row_dimensions[3].height = 30
 
-        # DATA
-        row = 4
-        sr_no = 1
-        total_target = Decimal("0.00")
-        total_order = Decimal("0.00")
-        total_invoice = Decimal("0.00")
-        grand_total_products = 0
+        # ---------------------------------------------------------------- #
+        # DATA ROWS
+        # ---------------------------------------------------------------- #
+
+        row                  = 4
+        sr_no                = 1
+        total_target         = Decimal("0.00")
+        total_order          = Decimal("0.00")
+        total_invoice        = Decimal("0.00")
+        grand_total_products = Decimal("0.00")
 
         for m in months:
+
+            # Target
             target_obj = Region_Target.objects.filter(
                 region_id=region_id,
                 month__year=year,
                 month__month=m
             ).first()
+            target = self._to_decimal(
+                target_obj.target if target_obj else 0
+            )
 
-            target = self._to_decimal(target_obj.target if target_obj else 0)
-            month_order = Decimal("0.00")
-            month_total_products = 0
+            month_order          = Decimal("0.00")
+            month_total_products = Decimal("0.00")
 
             month_orders = purchase_orders.filter(
-                Q(po_date__year=year, po_date__month=m) |
-                Q(po_date__isnull=True, created_at__year=year, created_at__month=m)
+                Q(po_date__month=m) |
+                Q(po_date__isnull=True, created_at__month=m)
             )
 
             for po in month_orders:
-                items = po.product_items or []
-                for item in items:
+                for item in (po.product_items or []):
                     if not isinstance(item, dict):
                         continue
 
-                    qty = self._to_decimal(item.get("quantity", item.get("qty", 0)))
-                    product_id = self._get_item_product_id(item)
-
-                    if not product_id:
+                    pid = self._get_item_product_id(item)
+                    if not pid:
                         continue
 
-                    month_total_products += 1
+                    # ✅ qty with fallback + guard
+                    qty = self._to_decimal(
+                        item.get("quantity", item.get("qty", 0))
+                    )
+                    if qty <= 0:
+                        continue
 
-                    try:
-                        prod_obj = Product.objects.get(pk=product_id)
-                        base_price = Decimal(str(prod_obj.unit_distributor_price)) if getattr(prod_obj, 'unit_distributor_price', None) else prod_obj.mrp
-                    except (Product.DoesNotExist, ValueError, TypeError):
-                        base_price = self._get_order_amount_without_gst(item) / self._to_decimal(item.get("quantity", 1)) if self._to_decimal(item.get("quantity", 0)) > 0 else Decimal("0.00")
+                    # ✅ price with correct priority
+                    product_obj = product_map.get(pid)
+                    base_price  = self._get_base_price(item, product_obj)
 
-                    month_order += qty * base_price
+                    month_order          += qty * base_price
+                    month_total_products += qty
 
-            month_invoice = month_order + (month_order * self.gst_rate)
+            month_invoice = month_order * (Decimal("1") + self.GST_RATE)
 
-            total_target += target
-            total_order += month_order
-            total_invoice += month_invoice
+            total_target         += target
+            total_order          += month_order
+            total_invoice        += month_invoice
             grand_total_products += month_total_products
 
-            # WRITE ROW
+            # Write row
             ws.cell(row=row, column=1).value = sr_no
-            ws.cell(row=row, column=2).value = f"{calendar.month_abbr[m]}-{str(year)[-2:]}"
-            ws.cell(row=row, column=3).value = float(target)
-            ws.cell(row=row, column=4).value = month_total_products
-            ws.cell(row=row, column=5).value = float(month_order)
-            ws.cell(row=row, column=6).value = float(month_invoice)
+            ws.cell(row=row, column=2).value = (
+                f"{calendar.month_abbr[m]}-{str(year)[-2:]}"
+            )
 
-            for c in range(1, 7):
-                ws.cell(row=row, column=c).alignment = Alignment(horizontal="center")
+            for col, val in [
+                (3, target),
+                (4, month_total_products),
+                (5, month_order),
+                (6, month_invoice),
+            ]:
+                cell               = ws.cell(row=row, column=col)
+                cell.value         = self._to_float(val)
+                cell.number_format = "#,##0.00"
+                cell.alignment     = CENTER
+
+            for c in range(1, 3):
+                ws.cell(row=row, column=c).alignment = CENTER
 
             ws.row_dimensions[row].height = 25
-            row += 1
+            row   += 1
             sr_no += 1
 
+        # ---------------------------------------------------------------- #
         # TOTAL ROW
-        ws.cell(row=row, column=2).value = "TOTAL"
-        ws.cell(row=row, column=3).value = float(total_target)
-        ws.cell(row=row, column=4).value = grand_total_products
-        ws.cell(row=row, column=5).value = float(total_order)
-        ws.cell(row=row, column=6).value = float(total_invoice)
+        # ---------------------------------------------------------------- #
 
-        for c in range(2, 7):
-            ws.cell(row=row, column=c).font = Font(bold=True)
+        ws.cell(row=row, column=1).fill = YELLOW_FILL
+
+        total_label           = ws.cell(row=row, column=2)
+        total_label.value     = "TOTAL"
+        total_label.font      = Font(bold=True)
+        total_label.fill      = YELLOW_FILL
+        total_label.alignment = CENTER
+
+        for col, val in [
+            (3, total_target),
+            (4, grand_total_products),
+            (5, total_order),
+            (6, total_invoice),
+        ]:
+            cell               = ws.cell(row=row, column=col)
+            cell.value         = self._to_float(val)
+            cell.number_format = "#,##0.00"
+            cell.font          = Font(bold=True)
+            cell.fill          = YELLOW_FILL
+            cell.alignment     = CENTER
 
         ws.row_dimensions[row].height = 28
 
+        # ---------------------------------------------------------------- #
         # RESPONSE
+        # ---------------------------------------------------------------- #
+
         response = HttpResponse(
-            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            content_type=(
+                "application/vnd.openxmlformats-"
+                "officedocument.spreadsheetml.sheet"
+            )
         )
-        response["Content-Disposition"] = f'attachment; filename="{region_obj.name}_region_target_report.xlsx"'
+
+        safe_name = (
+            str(region_obj.name)
+            .replace(" ", "_")
+            .replace("/", "_")
+        )
+        file_name = (
+            f"{safe_name}_{year}_{months[0]}_region_report.xlsx"
+            if len(months) == 1
+            else f"{safe_name}_region_target_report_{year}.xlsx"
+        )
+
+        response["Content-Disposition"] = f'attachment; filename="{file_name}"'
         wb.save(response)
         return response
-
  
     
 class WarrantyCardPDFView(APIView):
@@ -15017,7 +14841,6 @@ class WarrantyCardBulkPDFView(APIView):
         return response
 
 
-
 class GalleryAPIView(APIView):
 
     # ---------- GET ----------
@@ -15095,7 +14918,6 @@ class GalleryAPIView(APIView):
             "success": False,
             "errors": serializer.errors
         }, status=status.HTTP_400_BAD_REQUEST)
-
 
     # ---------- DELETE ----------
     def delete(self, request, pk=None):
@@ -15607,9 +15429,6 @@ class ResetPasswordAPIView(APIView):
             status=status.HTTP_400_BAD_REQUEST
         )
         
-
-
-
 class EmployeeForgotPasswordAPIView(APIView):
 
     # -----------------------------------
@@ -16135,6 +15954,45 @@ from openpyxl.styles import (
 )
 from openpyxl.utils import get_column_letter
 
+import os
+from datetime import datetime
+
+from django.conf import settings
+from django.http import HttpResponse
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from rest_framework.views import APIView
+
+from .models import Shipment_product
+
+
+import os
+from datetime import datetime
+
+from django.conf import settings
+from django.http import HttpResponse, JsonResponse
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from rest_framework.views import APIView
+
+from .models import Shipment_product
+
+
+import os
+from datetime import datetime
+from io import BytesIO
+
+from django.http import HttpResponse
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from rest_framework.views import APIView
+
+from .models import Shipment_product
+
+
 class ShipmentProductExcelDownloadAPI(APIView):
 
     def get(self, request):
@@ -16143,13 +16001,11 @@ class ShipmentProductExcelDownloadAPI(APIView):
         # ✅ Get Filters
         # =====================================
 
-        batch_id = request.GET.get("batch_id")
-        product_name = request.GET.get("product_name")
-        start_date = request.GET.get("start_date")
-        end_date = request.GET.get("end_date")
+        batch_id     = request.GET.get("batch_id", "").strip()
+        product_name = request.GET.get("product_name", "").strip()
 
         # =====================================
-        # ✅ Fetch Data
+        # ✅ Fetch Base Queryset
         # =====================================
 
         shipment_products = Shipment_product.objects.select_related(
@@ -16162,7 +16018,7 @@ class ShipmentProductExcelDownloadAPI(APIView):
 
         if batch_id:
             shipment_products = shipment_products.filter(
-                batch_data__icontains=batch_id
+                batch_data=batch_id
             )
 
         # =====================================
@@ -16173,19 +16029,12 @@ class ShipmentProductExcelDownloadAPI(APIView):
             shipment_products = shipment_products.filter(
                 product_id__product_name__icontains=product_name
             )
+
         # =====================================
-        # ✅ Filter By Start Date & End Date
+        # ✅ Evaluate Queryset Once
         # =====================================
 
-        if start_date:
-            shipment_products = shipment_products.filter(
-                created_at__date__gte=start_date
-            )
-
-        if end_date:
-            shipment_products = shipment_products.filter(
-                created_at__date__lte=end_date
-            )
+        shipment_products = list(shipment_products)
 
         # =====================================
         # ✅ Create Workbook
@@ -16205,21 +16054,11 @@ class ShipmentProductExcelDownloadAPI(APIView):
             fill_type="solid"
         )
 
-        white_font = Font(
-            bold=True,
-            color="FFFFFF"
-        )
+        white_font   = Font(bold=True, color="FFFFFF", name="Arial")
+        heading_font = Font(bold=True, color="FFFFFF", size=16, name="Arial")
+        data_font    = Font(name="Arial", size=10)
 
-        heading_font = Font(
-            bold=True,
-            color="FFFFFF",
-            size=16
-        )
-
-        center_alignment = Alignment(
-            horizontal="center",
-            vertical="center"
-        )
+        center_alignment = Alignment(horizontal="center", vertical="center")
 
         thin_border = Border(
             left=Side(style='thin'),
@@ -16232,50 +16071,34 @@ class ShipmentProductExcelDownloadAPI(APIView):
         # ✅ Main Heading
         # =====================================
 
-        ws.merge_cells('A1:H2')
-
-        heading_cell = ws['A1']
-        heading_cell.value = "SHIPMENT PRODUCT REPORT"
-
-        heading_cell.fill = blue_fill
-        heading_cell.font = heading_font
+        ws.merge_cells('A1:I2')
+        heading_cell           = ws['A1']
+        heading_cell.value     = "SHIPMENT PRODUCT REPORT"
+        heading_cell.fill      = blue_fill
+        heading_cell.font      = heading_font
         heading_cell.alignment = center_alignment
-        heading_cell.border = thin_border
+        heading_cell.border    = thin_border
 
-        # =====================================
-        # ✅ Apply Style To Merged Cells
-        # =====================================
-
-        for row in ws['A1:H2']:
+        for row in ws['A1:I2']:
             for cell in row:
-                cell.fill = blue_fill
+                cell.fill   = blue_fill
                 cell.border = thin_border
 
         # =====================================
-        # ✅ Filter Heading
+        # ✅ Filter Info Row
         # =====================================
 
-        ws.merge_cells('A3:H3')
-
+        ws.merge_cells('A3:I3')
         filter_text = (
-                f"Batch ID : {batch_id or 'All'}"
-                f"    |    "
-                f"Product Name : {product_name or 'All'}"
-                f"    |    "
-                f"Start Date : {start_date or 'All'}"
-                f"    |    "
-                f"End Date : {end_date or 'All'}"
-            )
-        filter_cell = ws['A3']
-        filter_cell.value = filter_text
-
-        filter_cell.font = Font(
-            bold=True,
-            size=11
+            f"Batch ID : {batch_id or 'All'}"
+            f"    |    "
+            f"Product Name : {product_name or 'All'}"
         )
-
+        filter_cell           = ws['A3']
+        filter_cell.value     = filter_text
+        filter_cell.font      = Font(bold=True, size=11, name="Arial")
         filter_cell.alignment = center_alignment
-        filter_cell.border = thin_border
+        filter_cell.border    = thin_border
 
         # =====================================
         # ✅ Table Headers
@@ -16283,6 +16106,7 @@ class ShipmentProductExcelDownloadAPI(APIView):
 
         headers = [
             "Sr",
+            "Date",
             "Product",
             "Batch",
             "Landed Cost",
@@ -16292,182 +16116,82 @@ class ShipmentProductExcelDownloadAPI(APIView):
             "Qty",
         ]
 
-        header_row = 4
-
         for col_num, header in enumerate(headers, 1):
-
-            cell = ws.cell(
-                row=header_row,
-                column=col_num,
-                value=header
-            )
-
-            cell.fill = blue_fill
-            cell.font = white_font
+            cell           = ws.cell(row=4, column=col_num, value=header)
+            cell.fill      = blue_fill
+            cell.font      = white_font
             cell.alignment = center_alignment
-            cell.border = thin_border
+            cell.border    = thin_border
 
         # =====================================
         # ✅ Data Rows
         # =====================================
 
-        data_start_row = 5
+        for row_num, item in enumerate(shipment_products, start=5):
 
-        for row_num, item in enumerate(
-            shipment_products,
-            start=data_start_row
-        ):
+            item_date = item.created_at.strftime("%d-%m-%Y") if item.created_at else "N/A"
 
-            # ✅ SR No
-            ws.cell(
-                row=row_num,
-                column=1,
-                value=row_num - 4
-            )
+            row_data = [
+                row_num - 4,
+                item_date,
+                str(item.product_id),
+                item.batch_data,
+                float(item.landed_cost_allocated or 0),
+                float(item.per_unit_cost_inr or 0),
+                float(item.per_unit_cost_usd or 0),
+                item.allocation_basis,
+                item.quantity,
+            ]
 
-            # ✅ Product
-            ws.cell(
-                row=row_num,
-                column=2,
-                value=str(item.product_id)
-            )
-
-            # ✅ Batch
-            ws.cell(
-                row=row_num,
-                column=3,
-                value=item.batch_data
-            )
-
-            # ✅ Landed Cost
-            ws.cell(
-                row=row_num,
-                column=4,
-                value=float(item.landed_cost_allocated)
-            )
-
-            # ✅ INR / Unit
-            ws.cell(
-                row=row_num,
-                column=5,
-                value=float(item.per_unit_cost_inr)
-            )
-
-            # ✅ USD / Unit
-            ws.cell(
-                row=row_num,
-                column=6,
-                value=float(item.per_unit_cost_usd)
-            )
-
-            # ✅ Allocation Basis
-            ws.cell(
-                row=row_num,
-                column=7,
-                value=item.allocation_basis
-            )
-
-            # ✅ Qty
-            ws.cell(
-                row=row_num,
-                column=8,
-                value=item.quantity
-            )
-
-            # =====================================
-            # ✅ Apply Border + Alignment
-            # =====================================
-
-            for col in range(1, 9):
-
-                cell = ws.cell(
-                    row=row_num,
-                    column=col
-                )
-
+            for col_num, value in enumerate(row_data, start=1):
+                cell           = ws.cell(row=row_num, column=col_num, value=value)
                 cell.alignment = center_alignment
-                cell.border = thin_border
+                cell.border    = thin_border
+                cell.font      = data_font
 
         # =====================================
         # ✅ Column Widths
         # =====================================
 
         column_widths = {
-            1: 10,
-            2: 40,
-            3: 25,
-            4: 18,
-            5: 18,
-            6: 18,
-            7: 25,
-            8: 15,
+            1: 8,   # Sr
+            2: 18,  # Date
+            3: 40,  # Product
+            4: 25,  # Batch
+            5: 18,  # Landed Cost
+            6: 18,  # INR / Unit
+            7: 18,  # USD / Unit
+            8: 25,  # Allocation Basis
+            9: 15,  # Qty
         }
 
         for col_num, width in column_widths.items():
-
-            ws.column_dimensions[
-                get_column_letter(col_num)
-            ].width = width
+            ws.column_dimensions[get_column_letter(col_num)].width = width
 
         # =====================================
         # ✅ Row Heights
         # =====================================
 
-        ws.row_dimensions[1].height = 30
-        ws.row_dimensions[2].height = 30
-        ws.row_dimensions[3].height = 25
-        ws.row_dimensions[4].height = 25
+        for row_num, height in {1: 30, 2: 30, 3: 25, 4: 25}.items():
+            ws.row_dimensions[row_num].height = height
 
         # =====================================
-        # ✅ Create Reports Folder
+        # ✅ Save To Memory & Return Response
         # =====================================
 
-        folder_path = os.path.join(
-            settings.MEDIA_ROOT,
-            "reports"
-        )
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
 
-        os.makedirs(folder_path, exist_ok=True)
-
-        # =====================================
-        # ✅ File Name
-        # =====================================
-
-        file_name = (
-            f"shipment_product_report_"
-            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        )
-
-        file_path = os.path.join(
-            folder_path,
-            file_name
-        )
-
-        # =====================================
-        # ✅ Save Workbook
-        # =====================================
-
-        wb.save(file_path)
-
-        # =====================================
-        # ✅ Download Response
-        # =====================================
+        file_name = f"shipment_product_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
         response = HttpResponse(
-            open(file_path, 'rb'),
-            content_type=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            )
+            buffer.read(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
-        response['Content-Disposition'] = (
-            f'attachment; filename="{file_name}"'
-        )
+        response['Content-Disposition'] = f'attachment; filename="{file_name}"'
 
         return response
-    
-    
     
 class AllCategoryTargetReportExcelAPIView(APIView):
 

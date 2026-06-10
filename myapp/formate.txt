@@ -165,3 +165,14 @@ All Region excel  Download
 GET:-https://apidata.hogoautofilms.co.in/all-region-target-report-excel/
 filter by year
 GET:-https://apidata.hogoautofilms.co.in/all-region-target-report-excel/?year=2027
+
+
+10/06/2026
+Shipment Product Excel Download
+GET:-https://apidata.hogoautofilms.co.in/shipment-product-excel-download/
+filter by batch_id
+GET:-https://apidata.hogoautofilms.co.in/shipment-product-excel-download/?batch_id=111
+filter by product_name
+GET:-https://apidata.hogoautofilms.co.in/shipment-product-excel-download/?product_name=Yuva - Gloss 6 Years
+
+add one column of shipment product date  in excel are done
