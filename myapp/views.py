@@ -11060,7 +11060,6 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 
-
 class CategoryTargetReportAPIView(APIView):
 
     def _to_decimal(self, value, default="0.00"):
@@ -11077,15 +11076,14 @@ class CategoryTargetReportAPIView(APIView):
         return str(value)
 
     def _get_product_name(self, product):
-        for field in ["product_name", "name", "title", "item_name"]:
+        for field in ["name", "product_name", "title", "item_name"]:
             value = getattr(product, field, None)
             if value not in [None, "", "null"]:
                 return str(value)
         return str(product) if product else ""
 
     def _get_item_product_id(self, item):
-        """Extract product_id from a product_items dict entry."""
-        for key in ["product_id", "product", "id"]:
+        for key in ["product_id", "product", "product_data", "id"]:
             value = item.get(key)
             if value not in [None, "", "null"]:
                 if isinstance(value, dict):
@@ -11093,46 +11091,70 @@ class CategoryTargetReportAPIView(APIView):
                 return str(value)
         return None
 
-    def _parse_items(self, product_items):
-        """
-        product_items is JSONField so it's already a list.
-        But handle edge cases where it could be a string or None.
-        """
-        if not product_items:
-            return []
-        if isinstance(product_items, list):
-            return product_items
-        if isinstance(product_items, str):
-            try:
-                parsed = json.loads(product_items)
-                return parsed if isinstance(parsed, list) else []
-            except Exception:
-                return []
-        return []
+    def _get_order_amount_without_gst(self, item):
+        qty = self._to_decimal(item.get("quantity", 0))
 
-    def _get_base_price(self, item, product):
-        """
-        Get price from the PO item itself first,
-        then fall back to product.mrp.
-        """
-        # Try item-level prices first (from your PO JSON)
-        for key in ["unit_distributor_price", "mrp", "unit_price", "price"]:
-            val = item.get(key)
-            if val not in [None, "", "null", 0, "0", "0.00"]:
-                try:
-                    return Decimal(str(val))
-                except Exception:
-                    pass
+        if item.get("total_price") not in [None, "", "null"]:
+            return self._to_decimal(item.get("total_price"))
 
-        # Fall back to product.mrp
-        mrp = getattr(product, "mrp", None)
-        if mrp not in [None, "", "null"]:
-            try:
-                return Decimal(str(mrp))
-            except Exception:
-                pass
+        if item.get("subtotal") not in [None, "", "null"]:
+            return self._to_decimal(item.get("subtotal"))
+
+        if item.get("taxable_amount") not in [None, "", "null"]:
+            return self._to_decimal(item.get("taxable_amount"))
+
+        if item.get("total_amount") not in [None, "", "null"]:
+            return self._to_decimal(item.get("total_amount"))
+
+        if item.get("total_distributor_price") not in [None, "", "null"] and self._to_decimal(item.get("total_distributor_price")) > 0:
+            return self._to_decimal(item.get("total_distributor_price"))
+
+        if item.get("unit_distributor_price") not in [None, "", "null"] and self._to_decimal(item.get("unit_distributor_price")) > 0:
+            return self._to_decimal(item.get("unit_distributor_price")) * qty
+
+        if item.get("unit_price") not in [None, "", "null"]:
+            return self._to_decimal(item.get("unit_price")) * qty
+
+        if item.get("price") not in [None, "", "null"]:
+            return self._to_decimal(item.get("price")) * qty
+
+        if item.get("mrp") not in [None, "", "null"]:
+            return self._to_decimal(item.get("mrp")) * qty
 
         return Decimal("0.00")
+
+    def _get_invoice_amount_with_gst(self, item):
+        qty = self._to_decimal(item.get("quantity", 0))
+
+        unit_price = self._to_decimal(
+            item.get("unit_distributor_price", item.get("price", 0))
+        )
+
+        product_id = item.get("product_id")
+
+        gst_percentage = Decimal("0.00")
+
+        if product_id:
+            try:
+                product = Product.objects.get(id=product_id)
+
+                if product.GST:
+                    gst_percentage = self._to_decimal(
+                        str(product.GST).replace("%", "")
+                    )
+
+            except Product.DoesNotExist:
+                pass
+
+        taxable = qty * unit_price
+
+        gst_amount = (
+            taxable * gst_percentage / Decimal("100")
+        )
+
+        return (taxable + gst_amount).quantize(
+            Decimal("0.01")
+        )
 
     def get(self, request):
         category_id = request.GET.get("category")
@@ -11157,13 +11179,12 @@ class CategoryTargetReportAPIView(APIView):
         except ValueError:
             return Response({
                 "success": False,
-                "message": "Invalid month format"
+                "message": "Invalid month format. Use YYYY-MM or YYYY-MM-DD"
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        year      = parsed_date.year
+        year = parsed_date.year
         month_num = parsed_date.month
 
-        # ── Category Target ───────────────────────────────────────────────
         category_target = Category_Target.objects.filter(
             category_id=category_id,
             month__year=year,
@@ -11176,105 +11197,93 @@ class CategoryTargetReportAPIView(APIView):
                 "message": "No target found for this category and month"
             }, status=status.HTTP_404_NOT_FOUND)
 
-        total_target = self._to_decimal(category_target.target)
+        total_target = self._to_decimal(category_target.target, default="0.00")
 
-        # ── Products in this category ─────────────────────────────────────
-        products      = Product.objects.filter(category_id=category_id).order_by("id")
+        products = Product.objects.filter(category_id=category_id).order_by("id")
         product_count = products.count()
 
         if product_count == 0:
             return Response({
                 "success": True,
                 "category": self._safe_str(category_target.category),
-                "month":    category_target.month.strftime("%Y-%m"),
-                "target":   self._safe_str(category_target.target, "0"),
+                "month": category_target.month.strftime("%Y-%m") if category_target.month else "",
+                "target": self._safe_str(category_target.target, "0"),
                 "summary": {
-                    "total_products":          0,
                     "total_order_without_gst": "0.00",
-                    "total_invoice_with_gst":  "0.00"
+                    "total_invoice_with_gst": "0.00"
                 },
                 "products": []
             }, status=status.HTTP_200_OK)
 
-        per_product_target = total_target / Decimal(product_count)
+        per_product_target = total_target / Decimal(product_count) if product_count else Decimal("0.00")
 
-        # ── Purchase Orders for this month ────────────────────────────────
-        # po_date is auto_now_add DateTimeField — always set, never null
-        # Use created_at as backup filter too
+        from django.db.models import Q
+        # Deep Search: Get POs for the specified month
         purchase_orders = PurchaseOrder.objects.filter(
             Q(po_date__year=year, po_date__month=month_num) |
-            Q(created_at__year=year, created_at__month=month_num)
-        ).distinct().order_by("-id")
+            Q(po_date__isnull=True, created_at__year=year, created_at__month=month_num)
+        ).order_by("-id")
 
-        # ── Build product_id → product map for fast lookup ────────────────
-        product_map = {str(p.id): p for p in products}
-        product_ids = set(product_map.keys())
+        total_order = Decimal("0.00")
+        total_invoice = Decimal("0.00")
+        total_products = Decimal("0")
+        product_data = []
 
-        # ── Pre-calculate all quantities from PO items ────────────────────
-        # Structure: { product_id_str: {"qty": int, "order": Decimal, "invoice": Decimal} }
-        product_totals = {
-            pid: {"qty": 0, "order": Decimal("0.00"), "invoice": Decimal("0.00")}
-            for pid in product_ids
-        }
-
-        gst_rate = Decimal("0.18")
-
-        for po in purchase_orders:
-            items = self._parse_items(po.product_items)
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-
-                item_pid = self._get_item_product_id(item)
-                if not item_pid or item_pid not in product_ids:
-                    continue
-
-                qty = self._to_decimal(item.get("quantity", item.get("qty", 0)))
-                if qty <= 0:
-                    continue
-
-                product      = product_map[item_pid]
-                base_price   = self._get_base_price(item, product)
-
-                order_amt    = qty * base_price
-                invoice_amt  = order_amt * (Decimal("1") + gst_rate)
-
-                product_totals[item_pid]["qty"]     += int(qty)
-                product_totals[item_pid]["order"]   += order_amt
-                product_totals[item_pid]["invoice"] += invoice_amt
-
-        # ── Build response ────────────────────────────────────────────────
-        total_order    = Decimal("0.00")
-        total_invoice  = Decimal("0.00")
-        total_products = 0
-        product_data   = []
+        # gst_rate = Decimal("0.18")
 
         for product in products:
-            pid    = str(product.id)
-            totals = product_totals.get(pid, {"qty": 0, "order": Decimal("0.00"), "invoice": Decimal("0.00")})
+            order_total = Decimal("0.00")
+            invoice_total = Decimal("0.00")
+            po_total_products = Decimal("0")
 
-            total_products += totals["qty"]
-            total_order    += totals["order"]
-            total_invoice  += totals["invoice"]
+            # Use product's actual price
+            base_price = Decimal(str(product.unit_distributor_price)) if getattr(product, 'unit_distributor_price', None) else product.mrp
 
+            for po in purchase_orders:
+                items = po.product_items or []
+
+                if not isinstance(items, list):
+                    continue
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+
+                    item_product_id = self._get_item_product_id(item)
+
+                    if str(item_product_id) == str(product.id):
+                        qty = self._to_decimal(item.get("quantity", item.get("qty", 0)))
+                        po_total_products += qty
+
+                        # Without GST
+                        item_order_amt = self._get_order_amount_without_gst(item)
+                        order_total += item_order_amt
+
+                        # With GST
+                        item_invoice_amt = self._get_invoice_amount_with_gst(item)
+                        invoice_total += item_invoice_amt
+
+            total_order += order_total
+            total_invoice += invoice_total
+            total_products += po_total_products
             product_data.append({
-                "product_id":                    product.id,
-                "product_name":                  self._safe_str(self._get_product_name(product)),
-                "allotted_target":               str(per_product_target.quantize(Decimal("0.01"))),
-                "total_products":                totals["qty"],
-                "order_total_without_gst":       str(totals["order"].quantize(Decimal("0.01"))),
-                "actual_invoice_total_with_gst": str(totals["invoice"].quantize(Decimal("0.01"))),
+                "product_id": product.id if product.id is not None else 0,
+                "product_name": self._safe_str(self._get_product_name(product), ""),
+                "allotted_target": str(per_product_target.quantize(Decimal("0.01"))),
+                "order_total_without_gst": str(order_total.quantize(Decimal("0.01"))),
+                "actual_invoice_total_with_gst": str(invoice_total.quantize(Decimal("0.01"))),
+                "total_products": str(po_total_products.quantize(Decimal("1"))),
             })
 
         return Response({
             "success": True,
             "category": self._safe_str(category_target.category),
-            "month":    category_target.month.strftime("%Y-%m"),
-            "target":   self._safe_str(category_target.target, "0"),
+            "month": category_target.month.strftime("%Y-%m") if category_target.month else "",
+            "target": self._safe_str(category_target.target, "0"),
             "summary": {
-                "total_products":          total_products,
                 "total_order_without_gst": str(total_order.quantize(Decimal("0.01"))),
-                "total_invoice_with_gst":  str(total_invoice.quantize(Decimal("0.01")))
+                "total_invoice_with_gst": str(total_invoice.quantize(Decimal("0.01"))),
+                "total_products": str(total_products.quantize(Decimal("1")))
             },
             "products": product_data
         }, status=status.HTTP_200_OK)
@@ -12449,46 +12458,35 @@ class DistributorTargetReportAPIView(APIView):
             return default
         return str(value)
 
-    def _parse_items(self, product_items):
-        if not product_items:
-            return []
-        if isinstance(product_items, list):
-            return product_items
-        if isinstance(product_items, str):
-            try:
-                import json
-                parsed = json.loads(product_items)
-                return parsed if isinstance(parsed, list) else []
-            except Exception:
-                return []
-        return []
+    def _get_item_product_id(self, item):
+        for key in ["product_id", "product", "product_data", "id"]:
+            value = item.get(key)
+            if value not in [None, "", "null"]:
+                if isinstance(value, dict):
+                    return str(value.get("id") or value.get("product_id") or "")
+                return str(value)
+        return None
 
-    def _get_taxable_amount(self, item):
-        """
-        Get order amount WITHOUT GST from item.
-        Uses total_distributor_price first (your PO JSON has this),
-        then falls back to other price fields.
-        """
+    def _get_order_amount_without_gst(self, item):
         qty = self._to_decimal(item.get("quantity", 0))
 
-        # ✅ Your PO items have total_distributor_price — use it first
-        if item.get("total_distributor_price") not in [None, "", "null"]:
-            val = self._to_decimal(item.get("total_distributor_price"))
-            if val > 0:
-                return val
-
-        if item.get("unit_distributor_price") not in [None, "", "null"]:
-            val = self._to_decimal(item.get("unit_distributor_price"))
-            if val > 0:
-                return val * qty
-
         if item.get("total_price") not in [None, "", "null"]:
-            val = self._to_decimal(item.get("total_price"))
-            if val > 0:
-                return val
+            return self._to_decimal(item.get("total_price"))
 
         if item.get("subtotal") not in [None, "", "null"]:
             return self._to_decimal(item.get("subtotal"))
+
+        if item.get("taxable_amount") not in [None, "", "null"]:
+            return self._to_decimal(item.get("taxable_amount"))
+
+        if item.get("total_amount") not in [None, "", "null"]:
+            return self._to_decimal(item.get("total_amount"))
+
+        if item.get("total_distributor_price") not in [None, "", "null"] and self._to_decimal(item.get("total_distributor_price")) > 0:
+            return self._to_decimal(item.get("total_distributor_price"))
+
+        if item.get("unit_distributor_price") not in [None, "", "null"] and self._to_decimal(item.get("unit_distributor_price")) > 0:
+            return self._to_decimal(item.get("unit_distributor_price")) * qty
 
         if item.get("unit_price") not in [None, "", "null"]:
             return self._to_decimal(item.get("unit_price")) * qty
@@ -12501,9 +12499,59 @@ class DistributorTargetReportAPIView(APIView):
 
         return Decimal("0.00")
 
+    def _get_invoice_amount_with_gst(self, item):
+        qty = self._to_decimal(item.get("quantity", 0))
+
+        if item.get("final_amount") not in [None, "", "null"]:
+            return self._to_decimal(item.get("final_amount"))
+
+        if item.get("total_with_gst") not in [None, "", "null"]:
+            return self._to_decimal(item.get("total_with_gst"))
+
+        if item.get("amount_with_gst") not in [None, "", "null"]:
+            return self._to_decimal(item.get("amount_with_gst"))
+
+        if item.get("invoice_total") not in [None, "", "null"]:
+            return self._to_decimal(item.get("invoice_total"))
+
+        taxable = Decimal("0.00")
+        gst = Decimal("0.00")
+
+        if item.get("total_price") not in [None, "", "null"]:
+            taxable = self._to_decimal(item.get("total_price"))
+        elif item.get("subtotal") not in [None, "", "null"]:
+            taxable = self._to_decimal(item.get("subtotal"))
+        elif item.get("taxable_amount") not in [None, "", "null"]:
+            taxable = self._to_decimal(item.get("taxable_amount"))
+        elif item.get("total_amount") not in [None, "", "null"]:
+            taxable = self._to_decimal(item.get("total_amount"))
+        elif item.get("total_distributor_price") not in [None, "", "null"] and self._to_decimal(item.get("total_distributor_price")) > 0:
+            taxable = self._to_decimal(item.get("total_distributor_price"))
+        elif item.get("unit_distributor_price") not in [None, "", "null"] and self._to_decimal(item.get("unit_distributor_price")) > 0:
+            taxable = self._to_decimal(item.get("unit_distributor_price")) * qty
+        elif item.get("unit_price") not in [None, "", "null"]:
+            taxable = self._to_decimal(item.get("unit_price")) * qty
+        elif item.get("price") not in [None, "", "null"]:
+            taxable = self._to_decimal(item.get("price")) * qty
+        elif item.get("mrp") not in [None, "", "null"]:
+            taxable = self._to_decimal(item.get("mrp")) * qty
+
+        if item.get("gst_amount") not in [None, "", "null"]:
+            gst = self._to_decimal(item.get("gst_amount"))
+        elif item.get("gst") not in [None, "", "null"]:
+            gst = self._to_decimal(item.get("gst"))
+        else:
+            gst = (
+                self._to_decimal(item.get("cgst_amount", 0)) +
+                self._to_decimal(item.get("sgst_amount", 0)) +
+                self._to_decimal(item.get("igst_amount", 0))
+            )
+
+        return taxable + gst
+
     def get(self, request):
         distributor_id = request.GET.get("distributor_id")
-        month_value    = request.GET.get("month")
+        month_value = request.GET.get("month")
 
         if not distributor_id or not month_value:
             return Response({
@@ -12527,10 +12575,10 @@ class DistributorTargetReportAPIView(APIView):
                 "message": "Invalid month format. Use YYYY-MM or YYYY-MM-DD"
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        year      = parsed_date.year
+        year = parsed_date.year
         month_num = parsed_date.month
 
-        # ── Distributor Target ────────────────────────────────────────────
+        # Find target for this distributor
         distributor_target = DistributorInformation_Target.objects.filter(
             distributor_id=distributor_id,
             month__year=year,
@@ -12543,69 +12591,88 @@ class DistributorTargetReportAPIView(APIView):
                 "message": "No target found for this distributor and month"
             }, status=status.HTTP_404_NOT_FOUND)
 
-        # ── Purchase Orders ───────────────────────────────────────────────
+        from django.db.models import Q
+        # Deep Search: Get POs for this distributor in the specified month
         purchase_orders = PurchaseOrder.objects.filter(
-            distributor_id=distributor_id,
-            po_date__year=year,
-            po_date__month=month_num
+            Q(distributor_id=distributor_id),
+            Q(po_date__year=year, po_date__month=month_num) |
+            Q(po_date__isnull=True, created_at__year=year, created_at__month=month_num)
         ).order_by("-id")
 
-        # ✅ GST rate
-        gst_rate       = Decimal("0.18")
-        total_order    = Decimal("0.00")
-        total_invoice  = Decimal("0.00")
+        total_order = Decimal("0.00")
+        total_invoice = Decimal("0.00")
         total_products = 0
-        order_list     = []
+        order_list = []
 
         for po in purchase_orders:
-            # ✅ safely parse product_items
-            items = self._parse_items(po.product_items)
 
-            po_order    = Decimal("0.00")
-            po_invoice  = Decimal("0.00")
-            po_products = 0
+            serializer_data = PurchaseOrderSerializer(po).data
 
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
+            po_total_order = self._to_decimal(
+                serializer_data.get("distributor_price", 0)
+            )
+
+            po_total_invoice = Decimal("0.00")
+            po_total_products = 0
+
+            for item in serializer_data.get("product_items", []):
 
                 qty = int(self._to_decimal(item.get("quantity", 0)))
+                po_total_products += qty
 
-                # ✅ get taxable amount (without GST)
-                taxable = self._get_taxable_amount(item)
+                product_id = item.get("product_id")
 
-                # ✅ calculate GST on top of taxable
-                gst_amount = taxable * gst_rate
+                try:
+                    product = Product.objects.get(id=product_id)
 
-                po_products += qty
-                po_order    += taxable
-                po_invoice  += taxable + gst_amount  # ✅ with GST
+                    gst_rate = self._to_decimal(
+                        getattr(product, "gst", 18)
+                    ) / Decimal("100")
 
-            total_products += po_products
-            total_order    += po_order
-            total_invoice  += po_invoice
+                except Product.DoesNotExist:
+                    gst_rate = Decimal("0.18")
+
+                item_total = self._to_decimal(
+                    item.get("total_distributor_price", 0)
+                )
+
+                po_total_invoice += item_total * (
+                    Decimal("1") + gst_rate
+                )
+
+            total_order += po_total_order
+            total_invoice += po_total_invoice
+            total_products += po_total_products
 
             order_list.append({
-                "po_number":               po.po_number,
-                "po_date":                 po.po_date.strftime("%Y-%m-%d") if po.po_date else "",
-                "total_products":          po_products,
-                "total_order_without_gst": str(po_order.quantize(Decimal("0.01"))),
-                "total_invoice_with_gst":  str(po_invoice.quantize(Decimal("0.01"))),
+                "po_number": po.po_number,
+                "po_date": (po.po_date or po.created_at).strftime("%Y-%m-%d"),
+                "total_products": po_total_products,
+                "total_order_without_gst": str(
+                    po_total_order.quantize(Decimal("0.01"))
+                ),
+                "total_invoice_with_gst": str(
+                    po_total_invoice.quantize(Decimal("0.01"))
+                )
             })
 
         return Response({
-            "success":          True,
-            "distributor_id":   distributor_id,
-            "distributor_name": self._safe_str(distributor_target.distributor),
-            "month":            distributor_target.month.strftime("%Y-%m") if distributor_target.month else "",
-            "target":           self._safe_str(distributor_target.target, "0"),
-            "summary": {
-                "total_products":          total_products,
-                "total_order_without_gst": str(total_order.quantize(Decimal("0.01"))),
-                "total_invoice_with_gst":  str(total_invoice.quantize(Decimal("0.01")))
-            },
-            "orders": order_list
-        }, status=status.HTTP_200_OK)
+        "success": True,
+        "distributor_id": distributor_id,
+        "distributor_name": self._safe_str(distributor_target.distributor),
+        "month": distributor_target.month.strftime("%Y-%m") if distributor_target.month else "",
+        "target": self._safe_str(distributor_target.target, "0"),
+        "summary": {
+            "total_products": total_products,
+            "total_order_without_gst": str(
+                total_order.quantize(Decimal("0.01"))
+            ),
+            "total_invoice_with_gst": str(
+                total_invoice.quantize(Decimal("0.01"))
+            )
+        },
+        "orders": order_list
+    }, status=status.HTTP_200_OK)
         
 
 
@@ -13637,7 +13704,7 @@ class ProductTargetReportAPIView(APIView):
 
     def _to_decimal(self, value, default="0.00"):
         try:
-            if value in [None, "", "null"]:
+            if value in [None, "", "null", "0", "0.0", 0, 0.0]:
                 return Decimal(default)
             return Decimal(str(value))
         except (InvalidOperation, TypeError, ValueError):
@@ -13657,53 +13724,67 @@ class ProductTargetReportAPIView(APIView):
                 return str(value)
         return None
 
-    def _get_base_price(self, item, product):
-        """
-        Get price from PO item first, then fall back to product.mrp
-        """
-        # Try item-level price first
-        for key in ["unit_distributor_price", "mrp", "unit_price", "price"]:
-            val = item.get(key)
-            if val not in [None, "", "null", 0, "0", "0.00"]:
-                try:
-                    d = Decimal(str(val))
-                    if d > 0:
-                        return d
-                except Exception:
-                    pass
-
-        # Fall back to product.mrp
-        if product:
-            mrp = getattr(product, "mrp", None)
-            if mrp not in [None, "", "null"]:
-                try:
-                    return Decimal(str(mrp))
-                except Exception:
-                    pass
-
+    def _get_order_amount_without_gst(self, item):
+        qty = self._to_decimal(item.get("quantity", 0))
+        if item.get("total_price") not in [None, "", "null"]:
+            return self._to_decimal(item.get("total_price"))
+        if item.get("subtotal") not in [None, "", "null"]:
+            return self._to_decimal(item.get("subtotal"))
+        if item.get("taxable_amount") not in [None, "", "null"]:
+            return self._to_decimal(item.get("taxable_amount"))
+        if item.get("total_amount") not in [None, "", "null"]:
+            return self._to_decimal(item.get("total_amount"))
+        if item.get("total_distributor_price") not in [None, "", "null"] and self._to_decimal(item.get("total_distributor_price")) > 0:
+            return self._to_decimal(item.get("total_distributor_price"))
+        if item.get("unit_distributor_price") not in [None, "", "null"] and self._to_decimal(item.get("unit_distributor_price")) > 0:
+            return self._to_decimal(item.get("unit_distributor_price")) * qty
+        if item.get("unit_price") not in [None, "", "null"]:
+            return self._to_decimal(item.get("unit_price")) * qty
+        if item.get("price") not in [None, "", "null"]:
+            return self._to_decimal(item.get("price")) * qty
+        if item.get("mrp") not in [None, "", "null"]:
+            return self._to_decimal(item.get("mrp")) * qty
         return Decimal("0.00")
 
-    def _parse_product_items(self, product_items):
-        """
-        Safely parse product_items whether it's a list or JSON string
-        """
-        if not product_items:
-            return []
-        if isinstance(product_items, list):
-            return product_items
-        if isinstance(product_items, str):
+    def _get_invoice_amount_with_gst(self, item):
+
+        qty = self._to_decimal(item.get("quantity", 0))
+
+        unit_price = self._to_decimal(
+            item.get("unit_distributor_price", item.get("price", 0))
+        )
+
+        product_id = item.get("product_id")
+
+        gst_percentage = Decimal("0")
+
+        if product_id:
             try:
-                import json
-                parsed = json.loads(product_items)
-                return parsed if isinstance(parsed, list) else []
-            except Exception:
-                return []
-        return []
+                product = Product.objects.get(id=product_id)
+
+                if product.GST:
+                    gst_percentage = self._to_decimal(
+                        str(product.GST).replace("%", "")
+                    )
+
+            except Product.DoesNotExist:
+                pass
+
+        total_distributor_price = qty * unit_price
+
+        gst_amount = (
+            total_distributor_price * gst_percentage / Decimal("100")
+        )
+
+        total_with_gst = total_distributor_price + gst_amount
+
+        return total_with_gst.quantize(
+            Decimal("0.01")
+        )
 
     def get(self, request):
-        product_id  = request.GET.get("product_id")
+        product_id = request.GET.get("product_id")
         month_value = request.GET.get("month")
-
         if not product_id or not month_value:
             return Response({
                 "success": False,
@@ -13726,126 +13807,94 @@ class ProductTargetReportAPIView(APIView):
                 "message": "Invalid month format. Use YYYY-MM or YYYY-MM-DD"
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        year      = parsed_date.year
+        year = parsed_date.year
         month_num = parsed_date.month
 
-        # ── Product ───────────────────────────────────────────────────────
-        try:
-            prod_obj = Product.objects.get(pk=product_id)
-        except Product.DoesNotExist:
-            return Response({
-                "success": False,
-                "message": "Product not found"
-            }, status=status.HTTP_404_NOT_FOUND)
-
-        # ── Product Target ─────────────────────────────────────────────────
-        # First try Product_Target, then fall back to Category_Target
         from .models import Product_Target
-
         product_target = Product_Target.objects.filter(
             product_id=product_id,
             month__year=year,
             month__month=month_num
         ).first()
 
-        # If no Product_Target, try Category_Target and divide by product count
-        target_value = "0"
-        if product_target:
-            target_value = self._safe_str(product_target.target, "0")
-        else:
-            category_target = Category_Target.objects.filter(
-                category_id=prod_obj.category_id,
-                month__year=year,
-                month__month=month_num
-            ).first()
-            if category_target:
-                total_target  = self._to_decimal(category_target.target)
-                product_count = Product.objects.filter(
-                    category_id=prod_obj.category_id
-                ).count()
-                per_target   = (
-                    total_target / Decimal(product_count)
-                    if product_count else Decimal("0.00")
-                )
-                target_value = str(per_target.quantize(Decimal("0.01")))
+        if not product_target:
+            return Response({
+                "success": False,
+                "message": "No target found for this product and month"
+            }, status=status.HTTP_404_NOT_FOUND)
 
-        # ── Purchase Orders for this month ────────────────────────────────
-        # ✅ FIX: po_date is auto_now_add so never null — removed isnull filter
+        from django.db.models import Q
         purchase_orders = PurchaseOrder.objects.filter(
             Q(po_date__year=year, po_date__month=month_num) |
-            Q(created_at__year=year, created_at__month=month_num)
-        ).distinct().order_by("-id")
+            Q(po_date__isnull=True, created_at__year=year, created_at__month=month_num)
+        ).order_by("-id")
 
-        gst_rate       = Decimal("0.18")
-        total_order    = Decimal("0.00")
-        total_invoice  = Decimal("0.00")
-        total_quantity = Decimal("0.00")
-        order_list     = []
+        try:
+            from .models import Product
+            prod_obj = Product.objects.get(pk=product_id)
+            self.prod_obj = prod_obj
+        except:
+            self.prod_obj = None
+
+        total_order = Decimal("0.00")
+        total_products = Decimal("0")
+        total_invoice = Decimal("0.00")
+        order_list = []
 
         for po in purchase_orders:
-            # ✅ FIX: safely parse product_items (handles string & list)
-            items = self._parse_product_items(po.product_items)
+            items = po.product_items or []
 
-            po_order    = Decimal("0.00")
-            po_invoice  = Decimal("0.00")
-            po_quantity = Decimal("0.00")
-            matched     = 0
+            po_total_order = Decimal("0.00")
+            po_total_invoice = Decimal("0.00")
+            po_total_products = Decimal("0")
+            item_match_count = 0
 
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-
-                item_product_id = self._get_item_product_id(item)
-
-                # ✅ FIX: null check before comparison
-                if not item_product_id:
-                    continue
-
-                if str(item_product_id) == str(product_id):
-                    qty = self._to_decimal(
-                        item.get("quantity", item.get("qty", 0))
-                    )
-                    if qty <= 0:
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
                         continue
 
-                    # ✅ FIX: use item price not product.unit_distributor_price
-                    base_price   = self._get_base_price(item, prod_obj)
-                    order_amt    = qty * base_price
-                    invoice_amt  = order_amt * (Decimal("1") + gst_rate)
+                    item_product_id = self._get_item_product_id(item)
 
-                    po_quantity += qty
-                    po_order    += order_amt
-                    po_invoice  += invoice_amt
-                    matched     += 1
+                    if item_product_id and item_product_id == str(product_id).strip():
+                        qty = self._to_decimal(item.get("quantity", item.get("qty", 0)))
 
-            if matched > 0:
-                total_quantity += po_quantity
-                total_order    += po_order
-                total_invoice  += po_invoice
+                        without_gst = self._get_order_amount_without_gst(item)
+                        with_gst = self._get_invoice_amount_with_gst(item)
+
+                        po_total_products += qty
+                        po_total_order += without_gst
+                        po_total_invoice += with_gst
+
+                        item_match_count += 1
+
+            if item_match_count > 0:
+                total_order += po_total_order
+                total_invoice += po_total_invoice
+                total_products += po_total_products
 
                 order_list.append({
-                    "po_number":             po.po_number,
-                    "po_date":               po.po_date.strftime("%Y-%m-%d") if po.po_date else "",
-                    "total_products":        int(po_quantity),
-                    "total_order_without_gst": str(po_order.quantize(Decimal("0.01"))),
-                    "total_invoice_with_gst":  str(po_invoice.quantize(Decimal("0.01"))),
+                    "po_number": po.po_number,
+                    "po_date": po.po_date.strftime("%Y-%m-%d") if po.po_date else "",
+                    "total_products": str(po_total_products.quantize(Decimal("1"))),
+                    "total_order_without_gst": str(po_total_order.quantize(Decimal("0.01"))),
+                    "total_invoice_with_gst": str(po_total_invoice.quantize(Decimal("0.01")))
                 })
 
         return Response({
-            "success":      True,
-            "product_id":   product_id,
-            "product_name": self._safe_str(
-                                getattr(prod_obj, "product_name", None) or str(prod_obj)
-                            ),
-            "month":        month_value[:7],
-            "target":       target_value,
+            "success": True,
+            "product_id": product_id,
+            "product_name": self.prod_obj.product_name if self.prod_obj else "",
+            "month": product_target.month.strftime("%Y-%m") if product_target.month else "",
+            "target": self._safe_str(product_target.target, "0"),
             "summary": {
-                "total_products":          int(total_quantity),
                 "total_order_without_gst": str(total_order.quantize(Decimal("0.01"))),
-                "total_invoice_with_gst":  str(total_invoice.quantize(Decimal("0.01")))
+                "total_products": str(total_products.quantize(Decimal("1"))),
+                "total_invoice_with_gst": str(total_invoice.quantize(Decimal("0.01")))
             },
             "orders": order_list
         }, status=status.HTTP_200_OK)
+
          
 
 
@@ -14207,51 +14256,42 @@ class RegionTargetReportAPIView(APIView):
         return Decimal("0.00")
 
     def _get_invoice_amount_with_gst(self, item):
-        qty = self._to_decimal(item.get("quantity", 0))
+        qty = self._to_decimal(
+            item.get("quantity", item.get("qty", 0))
+        )
 
-        if item.get("final_amount") not in [None, "", "null"]:
-            return self._to_decimal(item.get("final_amount"))
-        if item.get("total_with_gst") not in [None, "", "null"]:
-            return self._to_decimal(item.get("total_with_gst"))
-        if item.get("amount_with_gst") not in [None, "", "null"]:
-            return self._to_decimal(item.get("amount_with_gst"))
-        if item.get("invoice_total") not in [None, "", "null"]:
-            return self._to_decimal(item.get("invoice_total"))
-
-        taxable = Decimal("0.00")
-        gst = Decimal("0.00")
-
-        if item.get("total_price") not in [None, "", "null"]:
-            taxable = self._to_decimal(item.get("total_price"))
-        elif item.get("subtotal") not in [None, "", "null"]:
-            taxable = self._to_decimal(item.get("subtotal"))
-        elif item.get("taxable_amount") not in [None, "", "null"]:
-            taxable = self._to_decimal(item.get("taxable_amount"))
-        elif item.get("total_amount") not in [None, "", "null"]:
-            taxable = self._to_decimal(item.get("total_amount"))
-        elif item.get("total_distributor_price") not in [None, "", "null"] and self._to_decimal(item.get("total_distributor_price")) > 0:
-            taxable = self._to_decimal(item.get("total_distributor_price"))
-        elif item.get("unit_distributor_price") not in [None, "", "null"] and self._to_decimal(item.get("unit_distributor_price")) > 0:
-            taxable = self._to_decimal(item.get("unit_distributor_price")) * qty
-        elif item.get("unit_price") not in [None, "", "null"]:
-            taxable = self._to_decimal(item.get("unit_price")) * qty
-        elif item.get("price") not in [None, "", "null"]:
-            taxable = self._to_decimal(item.get("price")) * qty
-        elif item.get("mrp") not in [None, "", "null"]:
-            taxable = self._to_decimal(item.get("mrp")) * qty
-
-        if item.get("gst_amount") not in [None, "", "null"]:
-            gst = self._to_decimal(item.get("gst_amount"))
-        elif item.get("gst") not in [None, "", "null"]:
-            gst = self._to_decimal(item.get("gst"))
-        else:
-            gst = (
-                self._to_decimal(item.get("cgst_amount", 0)) +
-                self._to_decimal(item.get("sgst_amount", 0)) +
-                self._to_decimal(item.get("igst_amount", 0))
+        unit_price = self._to_decimal(
+            item.get(
+                "unit_distributor_price",
+                item.get("price", 0)
             )
+        )
 
-        return taxable + gst
+        product_id = item.get("product_id")
+
+        gst_percentage = Decimal("0.00")
+
+        if product_id:
+            try:
+                product = Product.objects.get(id=product_id)
+
+                if product.GST:
+                    gst_percentage = self._to_decimal(
+                        str(product.GST).replace("%", "")
+                    )
+
+            except Product.DoesNotExist:
+                pass
+
+        taxable = qty * unit_price
+
+        gst_amount = (
+            taxable * gst_percentage / Decimal("100")
+        )
+
+        return (taxable + gst_amount).quantize(
+            Decimal("0.01")
+        )
 
     def get(self, request):
         region_id = request.GET.get("region_id")
@@ -14310,21 +14350,32 @@ class RegionTargetReportAPIView(APIView):
                 "message": "No target found for this region and month"
             }, status=status.HTTP_404_NOT_FOUND)
 
-        distributors = DistributorInformation.objects.filter(
-            Q(sales_region=str(region_obj.id)) | Q(sales_region__iexact=region_obj.name)
-        )
-        distributor_ids = list(distributors.values_list("id", flat=True))
-
         purchase_orders = PurchaseOrder.objects.filter(
-            distributor_id__in=distributor_ids,
-            po_date__year=year,
-            po_date__month=month_num
+            distributor_id__region_id=region_obj.id
+        ).filter(
+            Q(
+                po_date__year=year,
+                po_date__month=month_num
+            ) |
+            Q(
+                po_date__isnull=True,
+                created_at__year=year,
+                created_at__month=month_num
+            )
         ).order_by("-id")
 
         total_order = Decimal("0.00")
         total_invoice = Decimal("0.00")   # ✅ fixed: removed duplicate line
         total_products = 0
         order_list = []
+
+        print("Region ID:", region_obj.id)
+        print("Region Name:", region_obj.name)
+
+        print(
+            "PO Count:",
+            purchase_orders.count()
+        )
 
         for po in purchase_orders:
             items = po.product_items or []
@@ -14370,6 +14421,7 @@ class RegionTargetReportAPIView(APIView):
             },
             "orders": order_list
         }, status=status.HTTP_200_OK)
+
         
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
