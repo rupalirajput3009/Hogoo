@@ -236,5 +236,8 @@ urlpatterns = [
     
     path('shipment-product-excel-download/',ShipmentProductExcelDownloadAPI.as_view(),name='shipment-product-excel-download' ),
     
+    path("warranty-excel-report/", WarrantyExcelExportAPIView.as_view(), name="warranty-excel-export"),
+
+    
 
 ]

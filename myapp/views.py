@@ -17032,6 +17032,156 @@ class AllRegionTargetReportExcelAPIView(APIView):
         response["Content-Disposition"] = f'attachment; filename="{file_name}"'
         wb.save(response)
         return response
+# --------------------------------------------------------------------------
+# ADD THESE IMPORTS to the top of your existing views.py (alongside the
+# imports already used by WarrantyAPI)
+# --------------------------------------------------------------------------
+import openpyxl
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, PatternFill, Alignment
+from django.http import HttpResponse, JsonResponse
+from datetime import datetime
+
+
+# --------------------------------------------------------------------------
+# NEW VIEW: exports Warranty records as a downloadable .xlsx file, with
+# column names matching the Warranty Management table in the admin panel
+# (Serial Number, Car Details, Detailer, Mobile, Install Date, Warranty,
+# Warranty Status, Hold Reason).
+#
+#   GET /warranty/excel/                                  -> full list
+#   GET /warranty/excel/?warranty_status=ACTIVE            -> by status
+#   GET /warranty/excel/?start_date=2026-01-01&end_date=2026-06-01
+#                                                           -> by date range
+#   (status + date filters can be combined)
+#
+# Drop this class into views.py near WarrantyAPI.
+# --------------------------------------------------------------------------
+class WarrantyExcelExportAPIView(APIView):
+
+    # Confirmed against the Warranty model: created_at is a
+    # DateTimeField(auto_now_add=True), filtered via the __date lookup below.
+    DATE_FIELD = "created_at"
+
+    RED_FILL = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+    HEADING_FONT = Font(bold=True, color="000000", size=14)
+
+    # Matches the admin table columns exactly (minus "Action", which has
+    # nothing to export since it's just the view/edit icons in the UI)
+    HEADERS = [
+        "Serial Number",
+        "Car Details",
+        "Detailer",
+        "Mobile",
+        "Install Date",
+        "Warranty",
+        "Warranty Status",
+        "Hold Reason",
+    ]
+
+    def get(self, request):
+        warranties = Warranty.objects.select_related("serial_id").order_by("-id")
+
+        warranty_status = request.query_params.get("warranty_status")
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+
+        if warranty_status:
+            warranties = warranties.filter(warranty_status__iexact=warranty_status)
+
+        if start_date:
+            try:
+                parsed_start = datetime.strptime(start_date, "%Y-%m-%d").date()
+                warranties = warranties.filter(**{f"{self.DATE_FIELD}__date__gte": parsed_start})
+            except ValueError:
+                return JsonResponse(
+                    {"success": False, "errors": "start_date must be in YYYY-MM-DD format"},
+                    status=400
+                )
+
+        if end_date:
+            try:
+                parsed_end = datetime.strptime(end_date, "%Y-%m-%d").date()
+                warranties = warranties.filter(**{f"{self.DATE_FIELD}__date__lte": parsed_end})
+            except ValueError:
+                return JsonResponse(
+                    {"success": False, "errors": "end_date must be in YYYY-MM-DD format"},
+                    status=400
+                )
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Warranties"
+
+        # Row 1: "Warranty" heading, merged across all columns, red background
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(self.HEADERS))
+        heading_cell = ws.cell(row=1, column=1, value="Warranty")
+        heading_cell.fill = self.RED_FILL
+        heading_cell.font = self.HEADING_FONT
+        heading_cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 26
+
+        # Row 2: column headers (bold)
+        ws.append(self.HEADERS)
+        for cell in ws[2]:
+            cell.font = cell.font.copy(bold=True)
+
+        if not warranties.exists():
+            ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=len(self.HEADERS))
+            ws.cell(row=3, column=1, value="No warranty records found").alignment = Alignment(horizontal="center")
+        else:
+            for w in warranties:
+                serial_number = w.serial_id.serial_number if w.serial_id else "-"
+
+                car_details = " ".join(filter(None, [w.car_brand, w.car_model]))
+                if w.car_registration_number:
+                    car_details = f"{car_details} ({w.car_registration_number})" if car_details else w.car_registration_number
+                if not car_details:
+                    car_details = "-"
+
+                install_date = w.installation_date.strftime("%d %b %Y") if w.installation_date else "-"
+                warranty_period = f"{w.warranty_period} year" if w.warranty_period else "-"
+                hold_reason = w.hold_reason or "-"
+
+                ws.append([
+                    serial_number,
+                    car_details,
+                    w.detailer_name or "-",
+                    w.detailer_mobile or "-",
+                    install_date,
+                    warranty_period,
+                    w.warranty_status,
+                    hold_reason,
+                ])
+
+        # Reasonable fixed column widths matching each column's content type
+        widths = [16, 35, 22, 16, 16, 12, 16, 28]
+        for i, width in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = width
+
+        # Build a descriptive filename based on whatever filters were applied
+        filename_parts = ["warranty_list"]
+        if warranty_status:
+            filename_parts.append(warranty_status.lower())
+        if start_date:
+            filename_parts.append(start_date)
+        if end_date:
+            filename_parts.append(end_date)
+        filename = "_".join(filename_parts) + ".xlsx"
+
+        response = HttpResponse(
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        wb.save(response)
+        return response
+
+
+
+
+
+
+
 
 
 
